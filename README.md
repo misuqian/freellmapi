@@ -27,6 +27,7 @@ Aggregate the free tiers from Google, Groq, Cerebras, NVIDIA, Mistral, OpenRoute
 - [Docker](#docker)
 - [Desktop app](#desktop-app)
 - [Using the API](#using-the-api)
+- [CLI key manager](./docs/cli-key-manager.md)
 - [Screenshots](#screenshots)
 - [How it works](#how-it-works)
 - [Limitations](#limitations)
@@ -162,6 +163,8 @@ whichever limit prunes first. Set `REQUEST_ANALYTICS_RETENTION_DAYS=0` or
 Open http://localhost:5173 (the Vite dev UI), add your provider keys on the **Keys** page, reorder the **Fallback Chain** to taste, and grab your unified API key from the **Keys** page header. That unified key is what you point your OpenAI SDK at.
 
 > **Reaching the dev UI from another device on your LAN?** Use `npm run dev:lan` — it passes `--host` through to Vite, which then prints a `Network: http://<your-ip>:5173` URL you can open from a phone or another machine. (Plain `npm run dev -- --host` does *not* work here: the root `dev` script is a `concurrently` wrapper, so the flag never reaches Vite.) API calls go through Vite's dev proxy, so no extra server config is needed.
+
+> **Prefer the terminal?** `npm run keys` launches a CLI key manager that covers key management and fallback settings without a browser. See [docs/cli-key-manager.md](./docs/cli-key-manager.md) for details.
 
 For a production build without Docker:
 
