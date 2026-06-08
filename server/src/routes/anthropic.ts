@@ -83,7 +83,7 @@ const contentBlockSchema = z.union([
 ]);
 
 const anthropicMessageSchema = z.object({
-  role: z.enum(['user', 'assistant']),
+  role: z.enum(['user', 'assistant', 'system']),
   content: z.union([z.string(), z.array(contentBlockSchema)]),
 });
 
