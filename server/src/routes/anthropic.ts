@@ -499,13 +499,19 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
           blockStarted: boolean;
         }>();
         let totalOutputTokens = 0;
+        // Hoisted out of the loop: the last chunk's finish_reason (and its
+        // usage) are read after the stream ends to emit message_delta. Declaring
+        // these inside the for-await body made them block-scoped and raised
+        // "finishReason is not defined" once the loop exited.
+        let chunk: any;
+        let finishReason: string | null = null;
 
         try {
           const gen = route.provider.streamChatCompletion(
             route.apiKey, messages, route.modelId, completionOpts,
           );
 
-          for await (const chunk of gen) {
+          for await (chunk of gen) {
             // Start stream on first chunk
             if (!streamStarted) {
               res.setHeader('Content-Type', 'text/event-stream');
@@ -533,7 +539,8 @@ anthropicRouter.post('/messages', async (req: Request, res: Response) => {
             }
 
             const delta = chunk.choices?.[0]?.delta;
-            const finishReason = chunk.choices?.[0]?.finish_reason;
+            const chunkFinishReason = chunk.choices?.[0]?.finish_reason;
+            if (chunkFinishReason != null) finishReason = chunkFinishReason;
             if (!delta) continue;
 
             // Text content
