@@ -7,7 +7,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -42,6 +43,10 @@ describe('Virtual "auto" model', () => {
 
   beforeEach(async () => {
     const db = getDb();
+    // Unification is always on: /v1/models lists one entry per logical model
+    // (owned_by = freellmapi, id = canonical slug) that aggregates availability
+    // across its providers. This suite asserts the availability tagging (#242)
+    // and context-window advertising (#282) under that unified shape.
     db.prepare('DELETE FROM api_keys').run();
     db.prepare('DELETE FROM requests').run();
 
@@ -86,6 +91,114 @@ describe('Virtual "auto" model', () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  // #242: default returns the whole catalog, each entry annotated with whether
+  // it's currently usable (connected) and, if not, why.
+  it('returns the whole catalog by default, each tagged with availability (#242)', async () => {
+    const { status, body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+    expect(status).toBe(200);
+    expect(body.data[0]).toMatchObject({ id: 'auto', available: true, unavailable_reason: null });
+
+    const models = body.data.filter((m: any) => m.id !== 'auto');
+    expect(models.length).toBeGreaterThan(0);
+    for (const m of models) {
+      expect(typeof m.available).toBe('boolean');
+      if (m.available) expect(m.unavailable_reason).toBeNull();
+      else expect(['no_key', 'disabled']).toContain(m.unavailable_reason);
+    }
+    // Every logical model is owned_by freellmapi (unified). Only a groq key is
+    // seeded, so at least one model is available (served by groq) and at least
+    // one model with no provider key is listed but unavailable.
+    expect(models.every((m: any) => m.owned_by === 'freellmapi')).toBe(true);
+    expect(models.some((m: any) => m.available)).toBe(true);
+    expect(models.some((m: any) => !m.available && m.unavailable_reason === 'no_key')).toBe(true);
+  });
+
+  it('?available=true narrows to only connected models (#242)', async () => {
+    const filtered = await request(app, 'GET', '/v1/models?available=true', undefined, authHeaders());
+    expect(filtered.status).toBe(200);
+    const filteredModels = filtered.body.data.filter((m: any) => m.id !== 'auto');
+    expect(filteredModels.length).toBeGreaterThan(0);
+    expect(filteredModels.every((m: any) => m.available === true)).toBe(true);
+
+    // The unfiltered list is strictly larger — the keyless models reappear.
+    const all = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+    const allModels = all.body.data.filter((m: any) => m.id !== 'auto');
+    expect(allModels.length).toBeGreaterThan(filteredModels.length);
+  });
+
+  // #1100: every catalog row carries a machine-readable execution_status, and
+  // `?execution_status=` narrows to one of them so an agent can ask for models
+  // it can call right now without parsing the whole list.
+  it('?execution_status= narrows to that status (#1100)', async () => {
+    const all = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+    expect(all.status).toBe(200);
+    const catalog = all.body.data.filter((m: any) => m.execution_status !== undefined);
+    expect(catalog.length).toBeGreaterThan(0);
+    expect(catalog.every((m: any) => ['ready', 'needsKey', 'exhausted'].includes(m.execution_status))).toBe(true);
+    expect(catalog.some((m: any) => m.execution_status === 'ready')).toBe(true);
+    expect(catalog.some((m: any) => m.execution_status === 'needsKey')).toBe(true);
+
+    const ready = await request(app, 'GET', '/v1/models?execution_status=ready', undefined, authHeaders());
+    const readyModels = ready.body.data.filter((m: any) => m.execution_status !== undefined);
+    expect(readyModels.length).toBeGreaterThan(0);
+    expect(readyModels.every((m: any) => m.execution_status === 'ready')).toBe(true);
+    expect(readyModels.length).toBeLessThan(catalog.length);
+
+    // The value is camelCase but the query is matched case-insensitively.
+    const needsKey = await request(app, 'GET', '/v1/models?execution_status=needskey', undefined, authHeaders());
+    const needsKeyModels = needsKey.body.data.filter((m: any) => m.execution_status !== undefined);
+    expect(needsKeyModels.length).toBeGreaterThan(0);
+    expect(needsKeyModels.every((m: any) => m.execution_status === 'needsKey')).toBe(true);
+
+    // An unrecognised value filters nothing rather than emptying the list.
+    const bogus = await request(app, 'GET', '/v1/models?execution_status=banana', undefined, authHeaders());
+    expect(bogus.body.data.filter((m: any) => m.execution_status !== undefined).length).toBe(catalog.length);
+  });
+
+  it('marks a fully-disabled model with unavailable_reason "disabled" (#242)', async () => {
+    const db = getDb();
+    const row = db.prepare("SELECT display_name FROM models WHERE platform='groq' AND enabled=1 LIMIT 1").get() as { display_name: string } | undefined;
+    expect(row).toBeDefined();
+    // A unified model stays available while ANY of its providers is enabled, so
+    // disable every provider that serves this logical model (same display_name).
+    db.prepare('UPDATE models SET enabled=0 WHERE display_name=?').run(row!.display_name);
+    try {
+      const { body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+      const disabled = body.data.filter((m: any) => m.id !== 'auto' && m.unavailable_reason === 'disabled');
+      expect(disabled.length).toBeGreaterThan(0);
+      expect(disabled.every((m: any) => m.available === false)).toBe(true);
+    } finally {
+      db.prepare('UPDATE models SET enabled=1 WHERE display_name=?').run(row!.display_name);
+    }
+  });
+
+  // #282: clients read a model's context window from /v1/models; advertise it
+  // under both `context_window` and the OpenRouter-convention `context_length`,
+  // and give "auto" the largest window among connected models so clients don't
+  // fall back to a conservative ~16k default and truncate long inputs.
+  it('advertises context_length and a non-null auto context window (#282)', async () => {
+    const { status, body } = await request(app, 'GET', '/v1/models', undefined, authHeaders());
+    expect(status).toBe(200);
+
+    const auto = body.data.find((m: any) => m.id === 'auto');
+    expect(auto.context_window).toBe(auto.context_length);
+    expect(typeof auto.context_window).toBe('number');
+    expect(auto.context_window).toBeGreaterThan(0);
+
+    // Every real model mirrors context_window into context_length.
+    const connected = body.data.filter((m: any) => m.id !== 'auto' && m.available);
+    expect(connected.length).toBeGreaterThan(0);
+    for (const m of connected) {
+      expect(m.context_length).toBe(m.context_window);
+    }
+
+    // Auto's advertised ceiling is the max window among connected models.
+    const maxConnected = Math.max(
+      ...connected.filter((m: any) => m.context_window != null).map((m: any) => m.context_window),
+    );
+    expect(auto.context_window).toBe(maxConnected);
+  });
+
   it('treats model:"auto" as auto-route instead of a 400', async () => {
     const origFetch = global.fetch;
 
@@ -126,7 +239,7 @@ describe('Virtual "auto" model', () => {
       messages: [{ role: 'user', content: 'hello' }],
     }, authHeaders());
 
-    expect(status).toBe(400);
+    expect(status).toBe(404);
     expect(body.error.code).toBe('model_not_found');
   });
 });

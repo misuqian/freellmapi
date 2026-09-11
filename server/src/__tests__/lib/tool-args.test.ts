@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { repairToolArguments, toolSchemaMap } from '../../lib/tool-args.js';
+import { repairToolArguments, toolSchemaMap, stripSchemaKeys } from '../../lib/tool-args.js';
 
 const PLAN_SCHEMA = {
   type: 'object',
@@ -66,6 +66,93 @@ describe('repairToolArguments', () => {
   });
 });
 
+// The same model that stringifies a top-level array stringifies a nested one.
+// The repair walks the whole value now, re-applying the identical gate at each
+// level: depth adds reach, never latitude.
+const NESTED_SCHEMA = {
+  type: 'object',
+  properties: {
+    label: { type: 'string' },
+    config: {
+      type: 'object',
+      properties: {
+        tags: { type: 'array' },
+        note: { type: 'string' },
+        nested: { type: 'object', properties: { deep: { type: 'array' } } },
+      },
+    },
+    plan: {
+      type: 'array',
+      items: { type: 'object', properties: { steps: { type: 'array' }, name: { type: 'string' } } },
+    },
+  },
+};
+
+describe('repairToolArguments — nested values', () => {
+  it('decodes an array nested inside an object parameter', () => {
+    const broken = JSON.stringify({ config: { tags: '["a","b"]' } });
+    const repaired = JSON.parse(repairToolArguments(broken, NESTED_SCHEMA));
+    expect(repaired.config.tags).toEqual(['a', 'b']);
+  });
+
+  it('decodes through an object that was itself double-encoded', () => {
+    // Both levels broken at once, which is what these models actually emit.
+    const broken = JSON.stringify({ config: '{"tags": "[\\"a\\"]"}' });
+    const repaired = JSON.parse(repairToolArguments(broken, NESTED_SCHEMA));
+    expect(repaired.config.tags).toEqual(['a']);
+  });
+
+  it('descends more than two levels', () => {
+    const broken = JSON.stringify({ config: { nested: { deep: '[1,2,3]' } } });
+    const repaired = JSON.parse(repairToolArguments(broken, NESTED_SCHEMA));
+    expect(repaired.config.nested.deep).toEqual([1, 2, 3]);
+  });
+
+  it('decodes inside array elements via the items schema', () => {
+    const broken = JSON.stringify({ plan: [{ name: 'a', steps: '["one","two"]' }] });
+    const repaired = JSON.parse(repairToolArguments(broken, NESTED_SCHEMA));
+    expect(repaired.plan[0].steps).toEqual(['one', 'two']);
+    expect(repaired.plan[0].name).toBe('a');
+  });
+
+  it('still never touches a nested string-typed parameter', () => {
+    const args = JSON.stringify({ config: { note: '["literal text"]' } });
+    expect(repairToolArguments(args, NESTED_SCHEMA)).toBe(args);
+  });
+
+  it('still leaves a nested type mismatch alone', () => {
+    const args = JSON.stringify({ config: { tags: '{"not":"an array"}' } });
+    expect(repairToolArguments(args, NESTED_SCHEMA)).toBe(args);
+  });
+
+  it('leaves a nested key the schema does not describe alone', () => {
+    const args = JSON.stringify({ config: { unknown: '["a"]' } });
+    expect(repairToolArguments(args, NESTED_SCHEMA)).toBe(args);
+  });
+
+  it('leaves array elements alone when the schema has no items', () => {
+    // PLAN_SCHEMA's `plan` is a bare {type:'array'} — nothing describes an
+    // element, so nothing justifies decoding one.
+    const args = JSON.stringify({ plan: [{ steps: '["one"]' }] });
+    expect(repairToolArguments(args, PLAN_SCHEMA)).toBe(args);
+  });
+
+  it('is still byte-identical when a nested value needs nothing', () => {
+    const good = JSON.stringify({ config: { tags: ['a'], note: 'x' }, plan: [{ name: 'a', steps: [] }] });
+    expect(repairToolArguments(good, NESTED_SCHEMA)).toBe(good);
+  });
+
+  it('survives a self-referential schema without recursing forever', () => {
+    // A $ref-expanded recursive schema is a cycle; the walk follows the DATA,
+    // which is finite, so the schema's cycle is harmless.
+    const cyclic: any = { type: 'object', properties: { child: null, items: { type: 'array' } } };
+    cyclic.properties.child = cyclic;
+    const broken = JSON.stringify({ child: { child: { items: '[1]' } } });
+    const repaired = JSON.parse(repairToolArguments(broken, cyclic));
+    expect(repaired.child.child.items).toEqual([1]);
+  });
+});
+
 describe('toolSchemaMap', () => {
   it('maps function tools by name and skips non-function/unnamed entries', () => {
     const map = toolSchemaMap([
@@ -80,5 +167,72 @@ describe('toolSchemaMap', () => {
 
   it('handles undefined tools', () => {
     expect(toolSchemaMap(undefined).size).toBe(0);
+  });
+});
+
+describe('stripSchemaKeys', () => {
+  const keys = new Set(['additionalProperties', '$schema']);
+
+  it('removes the listed keys at the top level', () => {
+    const input = {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      additionalProperties: false,
+      properties: { city: { type: 'string' } },
+    };
+    expect(stripSchemaKeys(input, keys)).toEqual({
+      type: 'object',
+      properties: { city: { type: 'string' } },
+    });
+  });
+
+  it('removes the listed keys recursively in nested properties and arrays', () => {
+    const input = {
+      type: 'object',
+      additionalProperties: true,
+      properties: {
+        nested: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { n: { type: 'number' } },
+        },
+        list: {
+          type: 'array',
+          items: { type: 'object', additionalProperties: false, properties: {} },
+        },
+      },
+      anyOf: [{ type: 'string', additionalProperties: false }],
+    };
+    expect(stripSchemaKeys(input, keys)).toEqual({
+      type: 'object',
+      properties: {
+        nested: { type: 'object', properties: { n: { type: 'number' } } },
+        list: { type: 'array', items: { type: 'object', properties: {} } },
+      },
+      anyOf: [{ type: 'string' }],
+    });
+  });
+
+  it('does not mutate the input (chain-shared schema safety)', () => {
+    const input = { type: 'object', additionalProperties: false, properties: {} };
+    const copy = JSON.parse(JSON.stringify(input));
+    stripSchemaKeys(input, keys);
+    expect(input).toEqual(copy);
+  });
+
+  it('passes non-object values through unchanged', () => {
+    expect(stripSchemaKeys('hi', keys)).toBe('hi');
+    expect(stripSchemaKeys(42, keys)).toBe(42);
+    expect(stripSchemaKeys(null, keys)).toBe(null);
+    expect(stripSchemaKeys(undefined, keys)).toBe(undefined);
+  });
+
+  it('keeps a property literally named like a stripped key only when it is a value, not a key', () => {
+    // A property whose *value* mentions additionalProperties is untouched;
+    // only object KEYS named additionalProperties are removed.
+    const input = { type: 'object', properties: { additionalProperties: { type: 'boolean' } } };
+    // Here `additionalProperties` is a property NAME nested under `properties`,
+    // so it is a schema key and gets stripped — documenting the known limitation.
+    expect(stripSchemaKeys(input, keys)).toEqual({ type: 'object', properties: {} });
   });
 });

@@ -1,11 +1,90 @@
 import { describe, it, expect } from 'vitest';
-import { isRetryableError, isPaymentRequiredError, isModelNotFoundError } from '../../routes/proxy.js';
+import { isRetryableError, isPaymentRequiredError, isModelNotFoundError, isModelAccessForbiddenError } from '../../routes/proxy.js';
+import { isProviderBadRequestError } from '../../lib/error-classify.js';
+import { cooldownDecisionForError } from '../../lib/fallback-loop.js';
+import { MODEL_FORBIDDEN_COOLDOWN_MS } from '../../services/ratelimit.js';
+
+describe('isModelAccessForbiddenError (403 model-not-on-tier, drives whole-model skip — issue #256)', () => {
+  it('flags a 403 reaching the proxy by message or attached status', () => {
+    // GitHub Models / Cloudflare 403 a model the key's free tier can't reach.
+    expect(isModelAccessForbiddenError(new Error('GitHub Models API error 403: Model not available on your plan'))).toBe(true);
+    expect(isModelAccessForbiddenError(new Error('Cloudflare API error 403: this model requires a subscription'))).toBe(true);
+    expect(isModelAccessForbiddenError(new Error('Forbidden'))).toBe(true);
+    // #261 attaches the upstream status to the thrown error; honor it even if
+    // the message phrasing omits the code.
+    expect(isModelAccessForbiddenError(Object.assign(new Error('access denied'), { status: 403 }))).toBe(true);
+  });
+
+  it('does not flag rate limits, 404s, or payment errors', () => {
+    expect(isModelAccessForbiddenError(new Error('429 Too Many Requests'))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('HuggingFace Router API error 402: Payment required'))).toBe(false);
+  });
+
+  // Issue #618: some providers deny model access with a 400 (or 401) instead of
+  // a 403. Classified transient, those got the 90s bench — and the auto-router
+  // re-picked the same unreachable model the moment it expired, forever, with
+  // an escalating penalty. They must classify as model-inaccessible-for-this-key.
+  it('flags a 400/401 whose body says the key may not access the model (#618)', () => {
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 400: user is not allowed to access model kat-coder-pro-v2.5'),
+      { status: 400 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 400: action plan limited, please upgrade'),
+      { status: 400 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('API error 401: you do not have access to this model'),
+      { status: 401 },
+    ))).toBe(true);
+    expect(isModelAccessForbiddenError(
+      new Error('user is not allowed to access model kat-coder-pro-v2.5'),
+    )).toBe(true);
+  });
+
+  it('still leaves ordinary 400/401 rejections alone', () => {
+    expect(isModelAccessForbiddenError(Object.assign(new Error('Bad Request'), { status: 400 }))).toBe(false);
+    expect(isModelAccessForbiddenError(Object.assign(new Error('Unauthorized'), { status: 401 }))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('401 Unauthorized'))).toBe(false);
+    expect(isModelAccessForbiddenError(new Error('400 Bad Request'))).toBe(false);
+    expect(isModelAccessForbiddenError(Object.assign(
+      new Error('Groq API error 400: Failed to call a function. Please adjust your prompt.'),
+      { status: 400 },
+    ))).toBe(false);
+  });
+});
+
+// The loop-level consequence of the classification above: a "not allowed to
+// access" 400 must take the model-forbidden bench (a day, source 'tier'), not
+// the 90s transient one that made the router re-pick it every 90 seconds.
+describe('cooldownDecisionForError on a 400 not-allowed body (#618)', () => {
+  const route = {
+    platform: 'kat', modelId: 'kat-coder-pro-v2.5', modelDbId: 1, keyId: 1,
+    rpdLimit: null, tpdLimit: null,
+  } as any;
+
+  it('benches the model like a 403 instead of the transient ladder', () => {
+    const err = Object.assign(
+      new Error('API error 400: user is not allowed to access model kat-coder-pro-v2.5'),
+      { status: 400 },
+    );
+    const decision = cooldownDecisionForError(route, err);
+    expect(decision.durationMs).toBe(MODEL_FORBIDDEN_COOLDOWN_MS);
+    expect(decision.source).toBe('tier');
+  });
+});
 
 describe('isModelNotFoundError (drives whole-model skip within a request)', () => {
   it('flags 404 / not-found / no-endpoints phrasings', () => {
     expect(isModelNotFoundError(new Error('OpenRouter API error 404: Provider returned error'))).toBe(true);
     expect(isModelNotFoundError(new Error('Model not found'))).toBe(true);
     expect(isModelNotFoundError(new Error('No endpoints found for openrouter/minimax/minimax-m2.5:free'))).toBe(true);
+  });
+
+  it('flags 410 Gone (model pulled upstream) by message or attached status — #339', () => {
+    expect(isModelNotFoundError(new Error('Ollama Cloud API error 410: Gone'))).toBe(true);
+    expect(isModelNotFoundError(Object.assign(new Error('Gone'), { status: 410 }))).toBe(true);
   });
 
   it('does not flag rate limits, 5xx, or payment errors', () => {
@@ -65,6 +144,43 @@ describe('isRetryableError', () => {
     it('but a bare validation "400 Bad Request" (our own schema) is still NOT retryable', () => {
       expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
     });
+
+    it('flags provider API 400s for invalid-request exhaustion reporting', () => {
+      const err = Object.assign(
+        new Error('Google API error 400: Invalid JSON payload received. Unknown name "x-google-enum-descriptions"'),
+        { status: 400 },
+      );
+      expect(isProviderBadRequestError(err)).toBe(true);
+      expect(isProviderBadRequestError(new Error('400 Bad Request'))).toBe(false);
+      expect(isProviderBadRequestError(Object.assign(new Error('Bad Request'), { status: 400 }))).toBe(false);
+    });
+
+    it('treats provider API 422s like Mistral validation rejects: retryable, then invalid-request on exhaustion', () => {
+      const err = Object.assign(
+        new Error('Mistral API error 422: Unprocessable Entity'),
+        { status: 422 },
+      );
+      expect(isRetryableError(err)).toBe(true);
+      expect(isProviderBadRequestError(err)).toBe(true);
+      expect(isRetryableError(new Error('Mistral API error 422: tool messages failed validation'))).toBe(true);
+      expect(isProviderBadRequestError(new Error('Mistral API error 422: tool messages failed validation'))).toBe(true);
+    });
+  });
+
+  describe('403 model not on this key\'s tier fails over instead of 502 (issue #256)', () => {
+    it('treats a 403 from GitHub Models / Cloudflare as retryable', () => {
+      expect(isRetryableError(new Error('GitHub Models API error 403: Model not available on your plan'))).toBe(true);
+      expect(isRetryableError(new Error('Cloudflare API error 403: this model requires a subscription'))).toBe(true);
+    });
+
+    it('treats a bare "Forbidden" / attached 403 status as retryable', () => {
+      expect(isRetryableError(new Error('Forbidden'))).toBe(true);
+      expect(isRetryableError(Object.assign(new Error('access denied'), { status: 403 }))).toBe(true);
+    });
+
+    it('still treats a bare 400 validation error as non-retryable', () => {
+      expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
+    });
   });
 
   describe('402 Payment Required out-of-credits fails over (graceful degradation)', () => {
@@ -86,6 +202,37 @@ describe('isRetryableError', () => {
     });
   });
 
+  describe('410 Gone & un-enumerated upstream statuses fail over instead of 502 (#337/#339)', () => {
+    // The headline bug: a provider error whose HTTP status the substring allowlist
+    // never enumerated (410 Gone, 502, 504, 408 …) used to abort the whole chain
+    // with a 502 — stranding the healthy paid routes still queued later in the
+    // fallback order. It must rotate to the next route instead.
+    it('treats an Ollama "410: Gone" as retryable, by message and by attached status', () => {
+      // openai-compat throws via providerHttpError, so the real error carries both.
+      expect(isRetryableError(new Error('Ollama Cloud API error 410: Gone'))).toBe(true);
+      expect(isRetryableError(Object.assign(new Error('Ollama Cloud API error 410: Gone'), { status: 410 }))).toBe(true);
+    });
+
+    it('fails over on any 5xx the substring rules never listed, via the structured status', () => {
+      // No '502'/'504'/'507' substring rule exists; the err.status catch-all covers them.
+      expect(isRetryableError(Object.assign(new Error('Bad Gateway'), { status: 502 }))).toBe(true);
+      expect(isRetryableError(Object.assign(new Error('Gateway Timeout'), { status: 504 }))).toBe(true);
+      expect(isRetryableError(Object.assign(new Error('Insufficient Storage'), { status: 507 }))).toBe(true);
+    });
+
+    it('fails over on 408 request-timeout / 409 conflict by status', () => {
+      expect(isRetryableError(Object.assign(new Error('Request Timeout'), { status: 408 }))).toBe(true);
+      expect(isRetryableError(Object.assign(new Error('Conflict'), { status: 409 }))).toBe(true);
+    });
+
+    it('still treats genuinely-fatal 400/401 as NON-retryable even with an attached status', () => {
+      // The structured catch-all must not swallow client-fatal errors — they fail on
+      // every provider identically, so aborting the request is the correct behavior.
+      expect(isRetryableError(Object.assign(new Error('Bad Request'), { status: 400 }))).toBe(false);
+      expect(isRetryableError(Object.assign(new Error('Unauthorized'), { status: 401 }))).toBe(false);
+    });
+  });
+
   describe('existing categories still classify correctly', () => {
     it('429 / rate limits are retryable', () => {
       expect(isRetryableError(new Error('429 Too Many Requests'))).toBe(true);
@@ -100,11 +247,14 @@ describe('isRetryableError', () => {
       expect(isRetryableError(new Error('ECONNREFUSED'))).toBe(true);
     });
 
-    it('4xx auth/validation errors are NOT retryable', () => {
+    it('401 / bare-400 auth & validation errors are NOT retryable', () => {
       expect(isRetryableError(new Error('401 Unauthorized'))).toBe(false);
-      expect(isRetryableError(new Error('403 Forbidden'))).toBe(false);
       expect(isRetryableError(new Error('400 Bad Request'))).toBe(false);
       expect(isRetryableError(new Error('Invalid API key'))).toBe(false);
+      // 403 is deliberately NOT here anymore: a request-time 403 on a key that
+      // passed validateKey is a model-not-on-tier gate, so it fails over to the
+      // next model rather than 502-ing the request (issue #256). The 403 cases
+      // are covered in the dedicated describe block above.
     });
   });
 });

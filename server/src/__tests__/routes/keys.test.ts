@@ -7,7 +7,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -18,6 +19,38 @@ async function request(app: Express, method: string, path: string, body?: any) {
       ...(isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {}),
     },
     body: body ? JSON.stringify(body) : undefined,
+  });
+
+  const data = await res.json().catch(() => null);
+  server.close();
+  return { status: res.status, body: data };
+}
+
+async function multipartRequest(
+  app: Express,
+  path: string,
+  field: 'file' | 'files',
+  files: Array<{ filename: string; content: string; type?: string }>,
+) {
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
+  const addr = server.address() as any;
+  const url = `http://127.0.0.1:${addr.port}${path}`;
+  const form = new FormData();
+  for (const file of files) {
+    form.append(
+      field,
+      new Blob([file.content], { type: file.type ?? 'text/plain' }),
+      file.filename,
+    );
+  }
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      ...(isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {}),
+    },
+    body: form,
   });
 
   const data = await res.json().catch(() => null);
@@ -72,12 +105,62 @@ describe('Keys API', () => {
     expect(body[0].platform).toBe('groq');
   });
 
+  it('POST /api/keys warns when the platform has no catalog models yet (#438)', async () => {
+    const db = getDb();
+    // Simulate the Agnes case: a registered platform whose models aren't in
+    // this install's catalog tier. Force it by disabling every agnes row (a
+    // fresh migrated DB already has zero agnes models, but be explicit).
+    db.prepare("UPDATE models SET enabled = 0 WHERE platform = 'agnes'").run();
+
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'agnes',
+      key: 'agnes_test_key_123456',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBe(0);
+    expect(body.notice).toBeTruthy();
+    expect(body.notice).toMatch(/no agnes models/i);
+  });
+
+  it('POST /api/keys does not warn when the platform has catalog models', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'groq',
+      key: 'gsk_test123456789',
+    });
+    expect(status).toBe(201);
+    expect(body.modelsAvailable).toBeGreaterThan(0);
+    expect(body.notice ?? null).toBeNull();
+  });
+
+  it('POST /api/keys accepts the modelscope platform (#581)', async () => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform: 'modelscope',
+      key: 'ms-test-invalid-not-a-real-token',
+      label: 'ModelScope test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe('modelscope');
+    // Catalog rows land only after community testing (#581), so a fresh DB
+    // has no modelscope models and the no-catalog-models notice is expected.
+    expect(body.modelsAvailable).toBe(0);
+  });
+
   it('POST /api/keys rejects invalid platform', async () => {
     const { status } = await request(app, 'POST', '/api/keys', {
       platform: 'invalid_platform',
       key: 'test',
     });
     expect(status).toBe(400);
+  });
+
+  it.each(['electronhub', 'experiential', 'router9', 'septor'])('accepts a %s key without seeding gated model rows', async platform => {
+    const { status, body } = await request(app, 'POST', '/api/keys', {
+      platform, key: 'not-a-real-test-key-12345', label: 'Gateway test',
+    });
+    expect(status).toBe(201);
+    expect(body.platform).toBe(platform);
+    expect(body.modelsAvailable).toBe(0);
+    expect(getDb().prepare('SELECT COUNT(*) AS n FROM models WHERE platform = ?').get(platform)).toEqual({ n: 0 });
   });
 
   it('POST /api/keys rejects missing key', async () => {
@@ -176,5 +259,116 @@ describe('Keys API', () => {
   it('PATCH /api/keys/:id returns 404 for nonexistent key', async () => {
     const { status } = await request(app, 'PATCH', '/api/keys/99999', { label: 'test' });
     expect(status).toBe(404);
+  });
+
+  describe('key import', () => {
+    it('previews keys from multiple supported files', async () => {
+      const { status, body } = await multipartRequest(app, '/api/keys/preview', 'files', [
+        { filename: 'keys.env', content: 'GROQ_API_KEY=gsk_test123\nANTHROPIC_API_KEY=sk-ant-test' },
+        { filename: 'more.jsonc', content: '{ // comment\n "MISTRAL_API_KEY": "mist_test456",\n}' },
+      ]);
+
+      expect(status).toBe(200);
+      expect(body.keys).toEqual([
+        { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', detectedPlatform: 'groq', prefix: 'GROQ_', isDuplicate: false },
+        { keyName: 'ANTHROPIC_API_KEY', keyValue: 'sk-ant-test', detectedPlatform: null, prefix: 'ANTHROPIC_', isDuplicate: false },
+        { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', detectedPlatform: 'mistral', prefix: 'MISTRAL_', isDuplicate: false },
+      ]);
+      expect(body.total).toBe(3);
+      expect(body.duplicates).toBe(0);
+    });
+
+    it('imports selected preview rows', async () => {
+      const { status, body } = await request(app, 'POST', '/api/keys/import-selected', {
+        keys: [
+          { keyName: 'GROQ_API_KEY', keyValue: 'gsk_test123', platform: 'groq' },
+          { keyName: 'MISTRAL_API_KEY', keyValue: 'mist_test456', platform: 'mistral' },
+        ],
+      });
+
+      expect(status).toBe(200);
+      expect(body).toMatchObject({ imported: 2, skipped: [], errors: [], total: 2 });
+
+      const { body: keys } = await request(app, 'GET', '/api/keys');
+      expect(keys.map((key: any) => key.platform).sort()).toEqual(['groq', 'mistral']);
+    });
+
+    it('auto-imports recognized keys from one file and skips unknown providers', async () => {
+      const { status, body } = await multipartRequest(app, '/api/keys/import', 'file', [
+        { filename: 'keys.env', content: 'GROQ_API_KEY=gsk_test123\nANTHROPIC_API_KEY=sk-ant-test' },
+      ]);
+
+      expect(status).toBe(200);
+      expect(body.imported).toBe(1);
+      expect(body.skipped).toContain('ANTHROPIC_API_KEY');
+
+      const { body: keys } = await request(app, 'GET', '/api/keys');
+      expect(keys).toHaveLength(1);
+      expect(keys[0].platform).toBe('groq');
+    });
+
+    it('rejects unsupported files and malformed JSON uploads', async () => {
+      const unsupported = await multipartRequest(app, '/api/keys/preview', 'files', [
+        { filename: 'keys.js', content: 'module.exports = {}' },
+      ]);
+      expect(unsupported.status).toBe(400);
+      expect(unsupported.body.error.message).toBe('Unsupported file type');
+
+      const malformed = await multipartRequest(app, '/api/keys/import', 'file', [
+        { filename: 'keys.json', content: '{bad json' },
+      ]);
+      expect(malformed.status).toBe(400);
+      expect(malformed.body.error.message).toBe('Invalid JSON format');
+    });
+  });
+
+  // #705: the dashboard only ever had the platform-wide switch, which for the
+  // Custom group meant every endpoint the operator runs. These are the two
+  // scopes it now offers, kept honest against each other.
+  describe('enable scope', () => {
+    async function addKey(platform: string, key: string) {
+      const { body } = await request(app, 'POST', '/api/keys', { platform, key });
+      return body.id as number;
+    }
+    const enabledById = async () => {
+      const { body } = await request(app, 'GET', '/api/keys');
+      return Object.fromEntries((body as any[]).map(k => [k.id, k.enabled]));
+    };
+
+    it('PATCH /api/keys/:id disables one key and leaves its siblings alone', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+
+      const { status } = await request(app, 'PATCH', `/api/keys/${first}`, { enabled: false });
+
+      expect(status).toBe(200);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('PATCH /api/keys/platform/:platform still writes every key of that platform', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      const other = await addKey('cerebras', 'csk_other_key_789');
+
+      const { body } = await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      expect(body.updatedKeys).toBe(2);
+      expect(await enabledById()).toEqual({ [first]: false, [second]: false, [other]: true });
+    });
+
+    it('re-enables a single key of a platform that was switched off wholesale', async () => {
+      const first = await addKey('groq', 'gsk_first_key_123');
+      const second = await addKey('groq', 'gsk_second_key_456');
+      await request(app, 'PATCH', '/api/keys/platform/groq', { enabled: false });
+
+      await request(app, 'PATCH', `/api/keys/${second}`, { enabled: true });
+
+      expect(await enabledById()).toEqual({ [first]: false, [second]: true });
+    });
+
+    it('404s a key that does not exist', async () => {
+      const { status } = await request(app, 'PATCH', '/api/keys/99999', { enabled: false });
+      expect(status).toBe(404);
+    });
   });
 });

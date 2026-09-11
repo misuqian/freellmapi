@@ -6,7 +6,8 @@ import { routeRequest, setRoutingStrategy } from '../../services/router.js';
 import { encrypt } from '../../lib/crypto.js';
 
 async function post(app: Express, path: string, body: any, key: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -41,6 +42,16 @@ const TOOLS_RESPONSES = {
     name: 'get_weather',
     description: 'Get the weather for a city',
     parameters: { type: 'object', properties: { city: { type: 'string' } } },
+  }],
+};
+
+const BUILTIN_TOOL_RESPONSES = {
+  input: 'say hello',
+  tools: [{
+    type: 'local_shell',
+    name: 'exec_command',
+    description: 'Run a local shell command',
+    parameters: { type: 'object', properties: { cmd: { type: 'string' } } },
   }],
 };
 
@@ -83,6 +94,7 @@ describe('Tools-aware routing', () => {
   it('routeRequest skips non-tool models when requireTools is set', () => {
     const db = getDb();
     setRoutingStrategy('priority');
+    db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
 
     // One key for google, whose catalog holds both a non-tool model (gemma)
     // and tool-capable ones (gemini). Put gemma at the top of the chain.
@@ -132,6 +144,16 @@ describe('Tools-aware routing', () => {
     getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_tools = 1').run();
 
     const { status, body } = await post(app, '/v1/responses', TOOLS_RESPONSES, key);
+    expect(status).toBe(422);
+    expect(body.error.code).toBe('no_tools_model');
+
+    getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_tools = 1').run();
+  });
+
+  it('applies the /v1/responses tools gate before dropping built-in tool descriptors', async () => {
+    getDb().prepare('UPDATE models SET enabled = 0 WHERE supports_tools = 1').run();
+
+    const { status, body } = await post(app, '/v1/responses', BUILTIN_TOOL_RESPONSES, key);
     expect(status).toBe(422);
     expect(body.error.code).toBe('no_tools_model');
 

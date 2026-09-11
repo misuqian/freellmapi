@@ -4,7 +4,8 @@ import { createApp } from '../../app.js';
 import { initDb } from '../../db/index.js';
 
 async function call(app: Express, method: string, path: string, body?: any, token?: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method,
@@ -38,6 +39,7 @@ describe('Dashboard auth (#35)', () => {
     expect((await call(app, 'GET', '/api/keys')).status).toBe(401);
     expect((await call(app, 'GET', '/api/fallback')).status).toBe(401);
     expect((await call(app, 'GET', '/api/settings/api-key')).status).toBe(401);
+    expect((await call(app, 'GET', '/api/update/status')).status).toBe(401);
   });
 
   it('leaves /api/ping and the /v1 proxy reachable without a dashboard session', async () => {

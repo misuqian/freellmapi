@@ -7,13 +7,107 @@ import type {
   ChatToolDefinition,
   TokenUsage,
 } from '@freellmapi/shared/types.js';
-import { BaseProvider, type CompletionOptions } from './base.js';
+import { BaseProvider, providerHttpError, type CompletionOptions, type KeyValidationResult } from './base.js';
 import { contentToString } from '../lib/content.js';
+import { proxyFetch } from '../lib/proxy.js';
+import { recordQuotaObservationsFromResponse, type QuotaObservationContext } from '../services/provider-quota.js';
+import { providerTimeoutMs, streamStallTimeoutMs } from '../lib/provider-timeout.js';
+import { sanitizeForGemini } from '../lib/gemini-wire.js';
+import { resolveMaxTokens } from '../lib/sampling-params.js';
+
+export { sanitizeForGemini } from '../lib/gemini-wire.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
+// Gemini 3 REQUIRES the `thoughtSignature` that accompanied a function call to
+// be echoed back whenever that call appears in conversation history, or it
+// rejects the request with 400 "Function call is missing a thought_sig". But
+// OpenAI-format clients (the API surface we expose) have no standard field to
+// carry a provider-specific signature, so it can be dropped on the round-trip
+// and multi-turn tool conversations through Gemini fail. Cache each signature
+// we emit keyed by the tool-call id and by a stable name/arguments fingerprint;
+// the latter keeps the Anthropic bridge resilient when an agent/client rewrites
+// opaque tool ids. Strictly additive: a cache miss yields exactly the previous
+// behavior (the request may 400 and fail over, as before). Bounded with a TTL so
+// it can't grow unbounded.
+const THOUGHT_SIG_TTL_MS = 30 * 60 * 1000; // 30 min — longer than any single tool loop
+const THOUGHT_SIG_MAX = 5000;
+const thoughtSigCache = new Map<string, { sig: string; exp: number }>();
+
+function canonicalThoughtSigArgs(args: unknown): string {
+  if (typeof args === 'string') {
+    try { return JSON.stringify(JSON.parse(args)); } catch { return args; }
+  }
+  return JSON.stringify(args ?? {});
+}
+
+function thoughtSigCallKey(name: string | undefined, args: unknown): string | undefined {
+  if (!name) return undefined;
+  return `call:${name}:${canonicalThoughtSigArgs(args)}`;
+}
+
+// Fallback for functionCall parts that have neither a client-preserved nor a
+// cached signature (replayed history after a restart, TTL expiry, calls first
+// produced by another provider). Gemini 3 strictly validates the field, but
+// the signature is an encrypted blob the server checks — a fabricated value
+// (e.g. a hash) is NOT accepted. Google documents exactly two sentinel
+// strings for calls the API didn't produce; either tells the server to skip
+// signature validation (at the cost of some reasoning quality), which is the
+// official last resort for signature-less history.
+const DUMMY_THOUGHT_SIGNATURE = 'context_engineering_is_the_way_to_go';
+
+// The sentinel is a silent quality trade — Gemini stops validating and loses
+// the reasoning thread for that call — so say so once per process. A steady
+// stream of these means the cache is missing (restart loop, TTL too short, or
+// history minted by another provider) rather than a one-off replay, and
+// without a log there is nothing to correlate degraded tool-calling against.
+let warnedDummyThoughtSig = false;
+
+function noteDummyThoughtSignature(name: string | undefined): void {
+  if (warnedDummyThoughtSig) return;
+  warnedDummyThoughtSig = true;
+  console.warn(
+    `[Google] no thought_signature for a replayed tool call (${name ?? 'unknown'}); ` +
+    'falling back to the documented skip-validation sentinel — Gemini will not ' +
+    'validate the signature for these turns, at some reasoning-quality cost. ' +
+    '(Logged once per process.)',
+  );
+}
+
+function rememberThoughtSigKey(key: string | undefined, sig: string | undefined): void {
+  if (!key || !sig) return;
+  // Cheap eviction: when full, drop the oldest insertion (Map preserves order).
+  if (thoughtSigCache.size >= THOUGHT_SIG_MAX) {
+    const oldest = thoughtSigCache.keys().next().value;
+    if (oldest !== undefined) thoughtSigCache.delete(oldest);
+  }
+  thoughtSigCache.set(key, { sig, exp: Date.now() + THOUGHT_SIG_TTL_MS });
+}
+
+function rememberThoughtSig(callId: string | undefined, sig: string | undefined, name?: string, args?: unknown): void {
+  rememberThoughtSigKey(callId ? `id:${callId}` : undefined, sig);
+  rememberThoughtSigKey(thoughtSigCallKey(name, args), sig);
+}
+
+function recallThoughtSigKey(key: string | undefined): string | undefined {
+  if (!key) return undefined;
+  const hit = thoughtSigCache.get(key);
+  if (!hit) return undefined;
+  if (hit.exp < Date.now()) {
+    thoughtSigCache.delete(key);
+    return undefined;
+  }
+  return hit.sig;
+}
+
+function recallThoughtSig(callId: string | undefined, name?: string, args?: unknown): string | undefined {
+  return recallThoughtSigKey(callId ? `id:${callId}` : undefined)
+    ?? recallThoughtSigKey(thoughtSigCallKey(name, args));
+}
+
 interface GeminiPart {
   text?: string;
+  thought?: boolean;
   inlineData?: {
     mimeType: string;
     data: string;
@@ -42,6 +136,46 @@ interface GeminiResponse {
     promptTokenCount?: number;
     candidatesTokenCount?: number;
     totalTokenCount?: number;
+  };
+}
+
+type GeminiContent = { role: 'user' | 'model'; parts: GeminiPart[] };
+
+function isGemmaModel(modelId: string): boolean {
+  const normalized = modelId.toLowerCase().replace(/^models\//, '');
+  return /(?:^|[/.:])gemma[-_]/.test(normalized);
+}
+
+function systemInstructionText(systemInstruction: { parts?: Array<{ text?: string }> } | undefined): string | null {
+  const text = systemInstruction?.parts
+    ?.map(part => part.text ?? '')
+    .join('\n\n')
+    .trim();
+  return text ? text : null;
+}
+
+// Gemma models on the Gemini API historically 400 with "Developer instruction
+// is not enabled", so system prompts fold into the first user turn instead of
+// riding systemInstruction (#500). Older Gemma 3.x still rejects system
+// instructions and users can register those ids, so the fold stays. Tools and
+// functionCall/functionResponse history are deliberately NOT touched here
+// anymore: Gemma 4 supports native function calling, and stripping them made
+// the dashboard supports_tools toggle a no-op (#582).
+function contentsForModel(
+  modelId: string,
+  contents: GeminiContent[],
+  systemInstruction: { parts: Array<{ text: string }> } | undefined,
+): { contents: GeminiContent[]; systemInstruction?: { parts: Array<{ text: string }> } } {
+  if (!isGemmaModel(modelId)) return { contents, systemInstruction };
+
+  const systemText = systemInstructionText(systemInstruction);
+  if (!systemText) return { contents };
+
+  return {
+    contents: [
+      { role: 'user', parts: [{ text: systemText }] },
+      ...contents,
+    ],
   };
 }
 
@@ -75,50 +209,89 @@ function toGeminiFinishReason(finishReason?: string): string {
 // Google Gemini accepts only a subset of JSON Schema (~OpenAPI 3.0).
 // Strip fields that opencode / other strict-JSON-Schema clients send but
 // Google rejects with 400 "Unknown name '<field>'".
-const GEMINI_UNSUPPORTED_SCHEMA_KEYS = new Set([
-  '$schema', '$id', '$ref', '$defs', '$comment',
-  'definitions',
-  'exclusiveMinimum', 'exclusiveMaximum',
-  'patternProperties', 'unevaluatedProperties', 'unevaluatedItems',
-  'if', 'then', 'else',
-  'contentEncoding', 'contentMediaType', 'contentSchema',
-  'dependentRequired', 'dependentSchemas', 'dependencies',
-  'additionalProperties',
-  'examples', 'const', 'readOnly', 'writeOnly',
-  'uniqueItems',
-  'not', 'allOf', 'oneOf',
-  'prefixItems',
-  'contains', 'minContains', 'maxContains',
-  'propertyNames',
-  'multipleOf',
-  'deprecated',
-]);
+// OpenAI clients can't express Gemini's native Google Search grounding, so we
+// treat a tool named `google_search` (a few spellings) as the signal to enable
+// it. It maps to Gemini's `{ google_search: {} }` tool rather than a function
+// declaration, and can ride alongside real function tools in the same array. (#59)
+const GROUNDING_TOOL_NAMES = new Set(['google_search', 'googlesearch', 'google_search_retrieval']);
 
-export function sanitizeForGemini(schema: unknown): unknown {
-  if (Array.isArray(schema)) {
-    return schema.map(sanitizeForGemini);
+// reasoning_effort → Gemini thinkingBudget (tokens). The low/medium/high
+// budgets follow the common gateway convention (OpenRouter's effort mapping);
+// 'none'/'minimal' disable thinking outright. Models that can't run at the
+// requested budget 400 and fail over like any provider-invalid request.
+const EFFORT_THINKING_BUDGET: Record<'low' | 'medium' | 'high', number> = {
+  low: 1024,
+  medium: 8192,
+  high: 24576,
+};
+
+/**
+ * Extended generationConfig knobs translated from the OpenAI wire: topK,
+ * seed, penalties, and structured output. JSON output conflicts with function
+ * calling on Gemini ("Function calling with a response mime type:
+ * 'application/json' is unsupported"), so response_format is only applied on
+ * tool-free requests. Params Gemini has no equivalent for (min_p, logit_bias,
+ * logprobs…) are dropped by the platform policy in lib/sampling-params.ts and
+ * are ignored here. Exported for tests.
+ */
+export function toGeminiExtendedConfig(options?: CompletionOptions): Record<string, unknown> {
+  const out: Record<string, unknown> = {
+    topK: options?.top_k,
+    seed: options?.seed,
+    presencePenalty: options?.presence_penalty,
+    frequencyPenalty: options?.frequency_penalty,
+  };
+  const rf = options?.response_format;
+  // Count only real function declarations, mirroring hasFunctionDeclarations:
+  // grounding pseudo-tools (google_search etc.) are converted to a grounding
+  // block by toGeminiTools and never conflict with responseMimeType — raw
+  // tools.length was silently dropping structured output for grounding-only
+  // requests.
+  const hasTools = (options?.tools ?? []).some(t => !GROUNDING_TOOL_NAMES.has(t.function.name.toLowerCase()));
+  if (rf && !hasTools) {
+    out.responseMimeType = 'application/json';
+    const schema = rf.type === 'json_schema' ? rf.json_schema?.schema : undefined;
+    if (schema) out.responseSchema = sanitizeForGemini(schema);
   }
-  if (schema && typeof schema === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-      if (GEMINI_UNSUPPORTED_SCHEMA_KEYS.has(k)) continue;
-      out[k] = sanitizeForGemini(v);
-    }
-    return out;
+  // Request-side reasoning control: reasoning_effort → thinkingConfig. Only
+  // set when the client asked — a request without the knob keeps Gemini's
+  // model-default thinking behavior unchanged. includeThoughts surfaces
+  // thought summaries so reasoning_content flows back out (see
+  // extractReasoningContent).
+  const effort = options?.reasoning_effort;
+  if (effort) {
+    out.thinkingConfig = (effort === 'none' || effort === 'minimal')
+      ? { thinkingBudget: 0 }
+      : { thinkingBudget: EFFORT_THINKING_BUDGET[effort], includeThoughts: true };
   }
-  return schema;
+  return out;
 }
 
-function toGeminiTools(tools?: ChatToolDefinition[]): Array<{ functionDeclarations: Array<Record<string, unknown>> }> | undefined {
+function toGeminiTools(tools?: ChatToolDefinition[]): Array<Record<string, unknown>> | undefined {
   if (!tools || tools.length === 0) return undefined;
 
-  return [{
-    functionDeclarations: tools.map(t => ({
+  const functionDeclarations: Array<Record<string, unknown>> = [];
+  let grounding = false;
+  for (const t of tools) {
+    if (GROUNDING_TOOL_NAMES.has(t.function.name.toLowerCase())) {
+      grounding = true;
+      continue;
+    }
+    functionDeclarations.push({
       name: t.function.name,
       description: t.function.description,
       parameters: sanitizeForGemini(t.function.parameters),
-    })),
-  }];
+    });
+  }
+
+  const out: Array<Record<string, unknown>> = [];
+  if (grounding) out.push({ google_search: {} });
+  if (functionDeclarations.length > 0) out.push({ functionDeclarations });
+  return out.length > 0 ? out : undefined;
+}
+
+function hasFunctionDeclarations(tools?: Array<Record<string, unknown>>): boolean {
+  return tools?.some(t => 'functionDeclarations' in t) ?? false;
 }
 
 function toGeminiToolConfig(toolChoice?: ChatToolChoice): { functionCallingConfig: Record<string, unknown> } | undefined {
@@ -171,7 +344,11 @@ async function imageUrlToInlineData(url: string): Promise<{ mimeType: string; da
   }
   if (/^https?:\/\//i.test(url)) {
     try {
-      const res = await fetch(url);
+      // Internal helper that turns an image URL into inline data for the
+      // Gemini request body. No formal timeout — relies on the platform's
+      // own default. Use a 30s cap to avoid hanging the whole request when
+      // an image host stalls; classify as `image` for triage.
+      const res = await proxyFetch(url, { signal: AbortSignal.timeout(30_000) }, 'google', 'image', 30_000);
       if (!res.ok) return null;
       const buf = Buffer.from(await res.arrayBuffer());
       if (buf.length === 0 || buf.length > MAX_IMAGE_BYTES) return null;
@@ -210,7 +387,10 @@ async function userContentToParts(content: ChatMessage['content']): Promise<Gemi
 // Translate OpenAI messages to Gemini format. Content may arrive as a string,
 // null, or the OpenAI multimodal array envelope. System/assistant/tool messages
 // flatten to text; user messages additionally carry images as inlineData parts.
-async function toGeminiContents(messages: ChatMessage[]) {
+async function toGeminiContents(messages: ChatMessage[]): Promise<{
+  contents: GeminiContent[];
+  systemInstruction?: { parts: Array<{ text: string }> };
+}> {
   const systemMessages = messages
     .filter(m => m.role === 'system')
     .map(m => contentToString(m.content))
@@ -235,8 +415,18 @@ async function toGeminiContents(messages: ChatMessage[]) {
         }
 
         for (const call of m.tool_calls ?? []) {
+          // Prefer a signature the client preserved; otherwise recover the one
+          // we cached when this call was first produced (OpenAI-format clients
+          // drop the field, so this is the common path for Gemini multi-turn).
+          // If neither is available, fall back to Google's documented dummy
+          // sentinel so a signature-less replay still passes the strict 400
+          // check (parallel calls get it on every part — harmless, since the
+          // sentinel means "skip validation").
+          const known = call.thought_signature ?? recallThoughtSig(call.id, call.function.name, call.function.arguments);
+          if (!known) noteDummyThoughtSignature(call.function.name);
+          const sig = known ?? DUMMY_THOUGHT_SIGNATURE;
           parts.push({
-            thoughtSignature: call.thought_signature,
+            thoughtSignature: sig,
             functionCall: {
               id: call.id,
               name: call.function.name,
@@ -295,12 +485,17 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
     if (!part.functionCall?.name) continue;
 
     const id = part.functionCall.id ?? `call_${Date.now()}_${fallbackIndex++}`;
+    const args = normalizeGeminiArgs(part.functionCall.args);
+    // Cache the signature keyed by the id we hand the client, so when the client
+    // echoes this call back (without the signature, as OpenAI format requires)
+    // we can re-attach it and Gemini accepts the history.
+    rememberThoughtSig(id, part.thoughtSignature, part.functionCall.name, args);
     calls.push({
       id,
       type: 'function',
       function: {
         name: part.functionCall.name,
-        arguments: normalizeGeminiArgs(part.functionCall.args),
+        arguments: args,
       },
       thought_signature: part.thoughtSignature,
     });
@@ -312,45 +507,92 @@ function extractToolCalls(parts: GeminiPart[] | undefined): ChatToolCall[] {
 function extractText(parts: GeminiPart[] | undefined): string | null {
   if (!parts) return null;
   const text = parts
+    .filter(p => p.thought !== true)
     .map(p => p.text ?? '')
     .join('');
   return text.length > 0 ? text : null;
 }
 
+function extractReasoningContent(parts: GeminiPart[] | undefined): string | null {
+  if (!parts) return null;
+  const text = parts
+    .filter(p => p.thought === true)
+    .map(p => p.text ?? '')
+    .join('');
+  return text.length > 0 ? text : null;
+}
+
+function toGeminiStopSequences(stop: CompletionOptions['stop']): string[] | undefined {
+  if (!stop) return undefined;
+  return Array.isArray(stop) ? stop : [stop];
+}
+
+export interface GoogleProviderOptions {
+  /** Per-provider HTTP timeout override. Some Gemini models (notably
+   *  Gemma reasoning variants) take 20-60s on cold start; the OpenAI-compat
+   *  default of 15s false-flags them as broken. Mirrors OpenAICompatProvider. */
+  timeoutMs?: number;
+}
+
 export class GoogleProvider extends BaseProvider {
   readonly platform = 'google' as const;
   readonly name = 'Google AI Studio';
+  private readonly timeoutMs: number;
+
+  constructor(opts: GoogleProviderOptions = {}) {
+    super();
+    // PROVIDER_TIMEOUT_GOOGLE wins over the registration default (#547).
+    this.timeoutMs = providerTimeoutMs('google', opts.timeoutMs ?? 15000);
+  }
 
   async chatCompletion(
     apiKey: string,
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): Promise<ChatCompletionResponse> {
-    const { contents, systemInstruction } = await toGeminiContents(messages);
+    const translated = await toGeminiContents(messages);
+    const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
 
+    const tools = toGeminiTools(options?.tools);
     const body: Record<string, unknown> = {
-      contents,
+      contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: options?.max_tokens,
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
         topP: options?.top_p,
+        stopSequences: toGeminiStopSequences(options?.stop),
+        ...toGeminiExtendedConfig(options),
       },
-      tools: toGeminiTools(options?.tools),
-      toolConfig: toGeminiToolConfig(options?.tool_choice),
+      tools,
+      // functionCallingConfig is only valid when real function tools are present;
+      // a grounding-only request (just google_search) must omit it. (#59)
+      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(options?.tool_choice) : undefined,
     };
-    if (systemInstruction) body.systemInstruction = systemInstruction;
+    if (request.systemInstruction) body.systemInstruction = request.systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+    const url = `${API_BASE}/models/${modelId}:generateContent`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
+      // 'request' bounds: the deadline covers the body read too, so a 200
+      // whose body hangs aborts instead of stalling res.json() forever.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal, timeoutBounds: 'request' });
+
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
     }
 
     const data = await res.json() as GeminiResponse;
@@ -358,6 +600,7 @@ export class GoogleProvider extends BaseProvider {
     const parts = candidate?.content?.parts;
     const toolCalls = extractToolCalls(parts);
     const text = extractText(parts);
+    const reasoningContent = extractReasoningContent(parts);
 
     const usage: TokenUsage = {
       prompt_tokens: data.usageMetadata?.promptTokenCount ?? 0,
@@ -375,6 +618,7 @@ export class GoogleProvider extends BaseProvider {
         message: {
           role: 'assistant',
           content: text,
+          ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
           ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
         },
         finish_reason: toolCalls.length > 0 ? 'tool_calls' : toGeminiFinishReason(candidate?.finishReason),
@@ -389,31 +633,47 @@ export class GoogleProvider extends BaseProvider {
     messages: ChatMessage[],
     modelId: string,
     options?: CompletionOptions,
+    quotaContext?: QuotaObservationContext,
   ): AsyncGenerator<ChatCompletionChunk> {
-    const { contents, systemInstruction } = await toGeminiContents(messages);
+    const translated = await toGeminiContents(messages);
+    const request = contentsForModel(modelId, translated.contents, translated.systemInstruction);
 
+    const tools = toGeminiTools(options?.tools);
     const body: Record<string, unknown> = {
-      contents,
+      contents: request.contents,
       generationConfig: {
         temperature: options?.temperature,
-        maxOutputTokens: options?.max_tokens,
+        maxOutputTokens: resolveMaxTokens(this.platform, options?.max_tokens),
         topP: options?.top_p,
+        stopSequences: toGeminiStopSequences(options?.stop),
+        ...toGeminiExtendedConfig(options),
       },
-      tools: toGeminiTools(options?.tools),
-      toolConfig: toGeminiToolConfig(options?.tool_choice),
+      tools,
+      toolConfig: hasFunctionDeclarations(tools) ? toGeminiToolConfig(options?.tool_choice) : undefined,
     };
-    if (systemInstruction) body.systemInstruction = systemInstruction;
+    if (request.systemInstruction) body.systemInstruction = request.systemInstruction;
 
-    const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse&key=${apiKey}`;
+    const url = `${API_BASE}/models/${modelId}:streamGenerateContent?alt=sse`;
     const res = await this.fetchWithTimeout(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(body),
+      // Default 'headers' bounds: the deadline dies at response headers, and
+      // the client signal + stall watchdog own the stream from there.
+    }, options?.timeoutMs ?? this.timeoutMs, { signal: options?.signal });
+
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'chat/completions',
     });
 
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      throw new Error(`Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`);
+      throw providerHttpError(res, `Google API error ${res.status}: ${(err as any).error?.message ?? res.statusText}`, err);
     }
 
     const reader = res.body?.getReader();
@@ -427,20 +687,91 @@ export class GoogleProvider extends BaseProvider {
 
     const seenToolCallKeys = new Set<string>();
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+    // Same mid-stream inactivity watchdog as readSseStream (#553): this adapter
+    // parses Gemini's own frame format, so it reads the body itself and used to
+    // have no bound at all on a stalled read. Same first-byte grace as
+    // readSseStream too (#584): the chat timeout that bounded the headers also
+    // budgets the first read, floored at the stall budget.
+    const inactivityTimeoutMs = streamStallTimeoutMs(this.platform);
+    const firstByteMs = this.firstByteBudgetMs(options?.timeoutMs ?? this.timeoutMs, inactivityTimeoutMs);
+    let awaitingFirstByte = true;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split('\n');
-      buffer = lines.pop() ?? '';
+    try {
+      while (true) {
+        const { done, value } = awaitingFirstByte
+          ? await this.readWithStallTimeout(() => reader.read(), firstByteMs, this.firstByteTimeoutMessage(firstByteMs))
+          : await this.readWithStallTimeout(() => reader.read(), inactivityTimeoutMs);
+        awaitingFirstByte = false;
+        if (done) break;
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || !trimmed.startsWith('data: ')) continue;
-        const raw = trimmed.slice(6);
-        if (raw === '[DONE]') {
-          if (!emittedFinish) {
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() ?? '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          // `data:` with or without the space, same as BaseProvider (#1087).
+          if (!trimmed || !trimmed.startsWith('data:')) continue;
+          const raw = trimmed.slice(5).replace(/^ /, '');
+          if (raw === '[DONE]') {
+            if (!emittedFinish) {
+              emittedFinish = true;
+              yield {
+                id,
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: modelId,
+                choices: [{
+                  index: 0,
+                  delta: {},
+                  finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
+                }],
+              };
+            }
+            return;
+          }
+
+          // Skip malformed SSE frames instead of aborting the whole stream.
+          // Matches the defensive parse in openai-compat / cohere / cloudflare:
+          // a single corrupt chunk shouldn't take down the rest of the response.
+          let chunk: GeminiResponse;
+          try {
+            chunk = JSON.parse(raw) as GeminiResponse;
+          } catch {
+            continue;
+          }
+          const candidate = chunk.candidates?.[0];
+          const parts = candidate?.content?.parts ?? [];
+
+          const text = extractText(parts);
+          const reasoningContent = extractReasoningContent(parts);
+          const toolCalls = extractToolCalls(parts).filter(call => {
+            const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
+            if (seenToolCallKeys.has(key)) return false;
+            seenToolCallKeys.add(key);
+            return true;
+          });
+
+          if ((text && text.length > 0) || (reasoningContent && reasoningContent.length > 0) || toolCalls.length > 0) {
+            sawToolCalls = sawToolCalls || toolCalls.length > 0;
+            yield {
+              id,
+              object: 'chat.completion.chunk',
+              created: Math.floor(Date.now() / 1000),
+              model: modelId,
+              choices: [{
+                index: 0,
+                delta: {
+                  ...(text ? { content: text } : {}),
+                  ...(reasoningContent ? { reasoning_content: reasoningContent } : {}),
+                  ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+                },
+                finish_reason: null,
+              }],
+            };
+          }
+
+          if (candidate?.finishReason && !emittedFinish) {
             emittedFinish = true;
             yield {
               id,
@@ -450,67 +781,21 @@ export class GoogleProvider extends BaseProvider {
               choices: [{
                 index: 0,
                 delta: {},
-                finish_reason: sawToolCalls ? 'tool_calls' : 'stop',
+                finish_reason: sawToolCalls ? 'tool_calls' : toGeminiFinishReason(candidate.finishReason),
               }],
             };
+            return;
           }
-          return;
-        }
-
-        // Skip malformed SSE frames instead of aborting the whole stream.
-        // Matches the defensive parse in openai-compat / cohere / cloudflare:
-        // a single corrupt chunk shouldn't take down the rest of the response.
-        let chunk: GeminiResponse;
-        try {
-          chunk = JSON.parse(raw) as GeminiResponse;
-        } catch {
-          continue;
-        }
-        const candidate = chunk.candidates?.[0];
-        const parts = candidate?.content?.parts ?? [];
-
-        const text = extractText(parts);
-        const toolCalls = extractToolCalls(parts).filter(call => {
-          const key = `${call.id}:${call.function.name}:${call.function.arguments}`;
-          if (seenToolCallKeys.has(key)) return false;
-          seenToolCallKeys.add(key);
-          return true;
-        });
-
-        if ((text && text.length > 0) || toolCalls.length > 0) {
-          sawToolCalls = sawToolCalls || toolCalls.length > 0;
-          yield {
-            id,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: modelId,
-            choices: [{
-              index: 0,
-              delta: {
-                ...(text ? { content: text } : {}),
-                ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
-              },
-              finish_reason: null,
-            }],
-          };
-        }
-
-        if (candidate?.finishReason && !emittedFinish) {
-          emittedFinish = true;
-          yield {
-            id,
-            object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000),
-            model: modelId,
-            choices: [{
-              index: 0,
-              delta: {},
-              finish_reason: sawToolCalls ? 'tool_calls' : toGeminiFinishReason(candidate.finishReason),
-            }],
-          };
-          return;
         }
       }
+    } finally {
+      // Runs on normal completion, on the early returns above, AND when the
+      // consumer abandons the generator mid-stream (a client disconnect breaks
+      // the route pump's for-await, which calls gen.return() at the yield
+      // point). Without it the Gemini generation kept running upstream —
+      // quota burning with nobody reading — because this adapter reads the
+      // body itself instead of going through readSseStream's shared cleanup.
+      reader.cancel().catch(() => { /* upstream already gone */ });
     }
 
     if (!emittedFinish) {
@@ -528,14 +813,65 @@ export class GoogleProvider extends BaseProvider {
     }
   }
 
-  async validateKey(apiKey: string): Promise<boolean> {
+  async validateKey(apiKey: string, quotaContext?: QuotaObservationContext): Promise<KeyValidationResult> {
     // Transport errors propagate — health.ts marks status='error' without
-    // counting toward auto-disable. Only confirmed 401/403 disables a key.
+    // counting toward auto-disable.
     const res = await this.fetchWithTimeout(
-      `${API_BASE}/models?key=${apiKey}`,
-      { method: 'GET' },
+      `${API_BASE}/models`,
+      { method: 'GET', headers: { 'x-goog-api-key': apiKey } },
       10000,
+      { timeoutBounds: 'request' },
     );
-    return res.status !== 401 && res.status !== 403;
+    recordQuotaObservationsFromResponse(res, {
+      platform: this.platform,
+      keyId: quotaContext?.keyId,
+      providerAccountId: quotaContext?.providerAccountId,
+      modelId: quotaContext?.modelId,
+      quotaPoolKey: quotaContext?.quotaPoolKey,
+      endpoint: 'models',
+    });
+    if (res.ok) return true;
+
+    // Google's error taxonomy is NOT the usual 401/403-means-bad-key (#268):
+    //   - bad/expired key            → HTTP 400 INVALID_ARGUMENT / reason API_KEY_INVALID
+    //   - API not enabled on project → HTTP 403 PERMISSION_DENIED / reason SERVICE_DISABLED
+    //   - IP / referrer / API-key restriction, or empty key → HTTP 403 PERMISSION_DENIED
+    //   - unsupported region         → HTTP 400 FAILED_PRECONDITION ("User location is not supported")
+    // The old check (`status !== 401 && status !== 403`) had this exactly
+    // backwards: it marked a genuinely-bad 400 key as HEALTHY, and auto-disabled
+    // a perfectly good key that merely hit a permission/region/restriction 403 on
+    // the host running the proxy (the key still works for generateContent from
+    // another network). So only a CONFIRMED bad credential returns false (which
+    // counts toward auto-disable); every other non-2xx is inconclusive and throws
+    // so health.ts records status='error' WITHOUT disabling a usable key.
+    type GoogleErrorBody = { error?: { message?: unknown; status?: unknown; details?: unknown } };
+    let body: GoogleErrorBody | null = null;
+    try { body = (await res.json()) as GoogleErrorBody; } catch { /* non-JSON error body */ }
+    const err = body?.error;
+    const details = Array.isArray(err?.details) ? err!.details as Array<{ reason?: unknown }> : [];
+    const reason = details.find(d => typeof d?.reason === 'string')?.reason as string | undefined;
+    const message = typeof err?.message === 'string' ? err.message : '';
+    const gStatus = typeof err?.status === 'string' ? err.status : undefined;
+
+    const badCredentials =
+      res.status === 401 ||
+      reason === 'API_KEY_INVALID' ||
+      /API key not valid|API key expired|API_KEY_INVALID/i.test(message);
+    if (badCredentials) {
+      console.warn(`[Google] validateKey: key rejected as invalid (HTTP ${res.status}${reason ? ` ${reason}` : ''})`);
+      return {
+        valid: false,
+        error: `Google key validation failed (HTTP ${res.status}${reason ? ` ${reason}` : ''})${message ? `: ${message}` : ''}`,
+      };
+    }
+
+    console.warn(
+      `[Google] validateKey: inconclusive HTTP ${res.status} (${gStatus ?? 'UNKNOWN'}${reason ? `/${reason}` : ''}): ${message.slice(0, 200)} ` +
+      `— treating as 'error', not auto-disabling (the key may be valid but blocked by region/permission/restriction on this host).`,
+    );
+    throw new Error(
+      `Google key validation inconclusive (HTTP ${res.status}${gStatus ? ` ${gStatus}` : ''}${reason ? ` ${reason}` : ''})` +
+      `${message ? `: ${message}` : ''}`,
+    );
   }
 }

@@ -7,7 +7,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -100,5 +101,37 @@ describe('Provider error redaction', () => {
     expect(analyticsText).not.toContain(leakedKey);
     expect(analyticsText).not.toContain(leakedUrl);
     expect(analyticsText).toContain('[redacted]');
+  });
+
+  it('returns invalid_request_error when provider API 400s exhaust a pinned route', async () => {
+    const origFetch = global.fetch;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        return {
+          ok: false,
+          status: 400,
+          statusText: 'Bad Request',
+          headers: new Headers(),
+          json: () => Promise.resolve({
+            error: {
+              message: 'tool schema not supported',
+            },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const completion = await request(app, 'POST', '/v1/chat/completions', {
+      model: 'groq/compound-mini',
+      messages: [{ role: 'user', content: 'hello' }],
+    }, authHeaders());
+
+    expect(completion.status).toBe(400);
+    expect(completion.body.error.type).toBe('invalid_request_error');
+    expect(completion.body.error.message).toContain('rejected the request as invalid');
+    expect(completion.body.error.message).toContain('Groq API error 400');
   });
 });

@@ -104,8 +104,11 @@ function extractBalancedJson(text: string, from: number): { json: string; end: n
   return null;
 }
 
+// An empty set means the request declared no tools, so NOTHING is callable.
+// This used to read `toolNames.size === 0 || …`, which inverted that: a turn
+// with no tools opened the gate for every name the dialect parsers found.
 const isKnownTool = (name: string, toolNames: Set<string>): boolean =>
-  toolNames.size === 0 || toolNames.has(name);
+  toolNames.has(name);
 
 /** Parse `{"name": ..., "arguments"|"parameters": ...}` into a call. */
 function callFromNamedJson(json: string, toolNames: Set<string>): RescuedToolCall | null {

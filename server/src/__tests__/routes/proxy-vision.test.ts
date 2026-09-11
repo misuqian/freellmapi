@@ -4,7 +4,8 @@ import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 
 async function post(app: Express, path: string, body: any, key: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -83,5 +84,13 @@ describe('Vision-aware routing (#118, #125)', () => {
     expect(status).not.toBe(422);
     expect(body?.error?.code).not.toBe('no_vision_model');
     getDb().prepare('UPDATE models SET enabled = 1 WHERE supports_vision = 1').run();
+  });
+
+  it('lets a fusion image request through routing (no 422 fusion_no_vision)', async () => {
+    // Same seed as the auto case: vision models enabled but no provider keys,
+    // so routing exhausts. The point is that fusion is NOT rejected up front.
+    const { status, body } = await post(app, '/v1/chat/completions', { ...IMAGE_MESSAGE, model: 'fusion' }, key);
+    expect(status).not.toBe(422);
+    expect(body?.error?.code).not.toBe('fusion_no_vision');
   });
 });

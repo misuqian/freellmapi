@@ -23,7 +23,8 @@ const { encrypt } = await import('../../lib/crypto.js');
 const { setRoutingStrategy } = await import('../../services/router.js');
 
 async function post(app: Express, path: string, body: any, key: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -83,6 +84,9 @@ describe('Empty-completion failover', () => {
       .mockResolvedValueOnce(EMPTY_RESULT)
       .mockResolvedValueOnce(GOOD_RESULT);
 
+    const db = getDb();
+    db.prepare('DELETE FROM requests').run();
+
     const { status, body, headers } = await post(app, '/v1/chat/completions', {
       messages: [{ role: 'user', content: 'hi' }],
     }, key);
@@ -93,6 +97,12 @@ describe('Empty-completion failover', () => {
     expect(chatCompletion).toHaveBeenCalledTimes(2);
     // First model must differ from the one that answered.
     expect(chatCompletion.mock.calls[0][2]).not.toBe(chatCompletion.mock.calls[1][2]);
+
+    const rows = db.prepare('SELECT status, error FROM requests ORDER BY id').all() as Array<{ status: string; error: string | null }>;
+    expect(rows.length).toBe(2);
+    expect(rows[0].status).toBe('error');
+    expect(rows[0].error).toContain('empty completion');
+    expect(rows[1].status).toBe('success');
   });
 
   it('/v1/chat/completions (stream): zero-chunk stream fails over instead of emitting an empty stream', async () => {
@@ -147,6 +157,7 @@ describe('Empty-completion failover', () => {
     // at stream open was misclassified as mid-stream → returned to the client
     // with no failover and no cooldown (observed as 17 consecutive 503s to
     // the same model). With lazy headers it must take the retry path.
+    // eslint-disable-next-line require-yield -- mock stream that errors at open, no frames.
     async function* failsAtOpen(): AsyncGenerator<any> {
       throw new Error('OpenRouter API error 503: Provider returned error');
     }
@@ -171,15 +182,9 @@ describe('Empty-completion failover', () => {
       .mockResolvedValueOnce(EMPTY_RESULT)
       .mockResolvedValueOnce(GOOD_RESULT);
 
-    const db = getDb();
-    db.prepare('DELETE FROM requests').run();
-    await post(app, '/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, key);
+    const { headers } = await post(app, '/v1/chat/completions', { messages: [{ role: 'user', content: 'hi' }] }, key);
 
-    const rows = db.prepare('SELECT status, error FROM requests ORDER BY id').all() as Array<{ status: string; error: string | null }>;
-    expect(rows.length).toBe(2);
-    expect(rows[0].status).toBe('error');
-    expect(rows[0].error).toContain('empty completion');
-    expect(rows[1].status).toBe('success');
+    expect(headers.get('x-request-id')).toMatch(/\S+/);
   });
 
   it('a tool-calls-only completion (no text) is NOT treated as empty', async () => {

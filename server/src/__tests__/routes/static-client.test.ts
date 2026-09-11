@@ -26,7 +26,8 @@ describe('CLIENT_DIST override', () => {
   it('serves the SPA from the overridden directory', async () => {
     process.env.CLIENT_DIST = tmpDir;
     const app = createApp();
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const port = (server.address() as any).port;
 
     const res = await fetch(`http://127.0.0.1:${port}/`);

@@ -138,4 +138,33 @@ describe('inline tool-call dialect rescue', () => {
       expect(containsDialectMarker('plain text')).toBe(false);
     });
   });
+
+  // A turn that declared no tools has nothing callable, so no name can be
+  // "known". The gate used to read `toolNames.size === 0 || has(name)`, which
+  // meant the empty set matched EVERY name: prose that merely looked like a
+  // dialect was reconstructed into tool_calls the caller never asked for and
+  // cannot interpret.
+  describe('an empty tool set makes nothing callable', () => {
+    const EMPTY = new Set<string>();
+
+    it('does not synthesize a call from the function-tag dialect', () => {
+      const out = rescueInlineToolCalls('<function=Bash{"command":"rm -rf /"}</function>', EMPTY);
+      expect(out.calls).toBeNull();
+    });
+
+    it('does not synthesize a call from the Kimi/DeepSeek token dialect', () => {
+      const text = '<|tool_call_begin|>functions.Bash:0<|tool_call_argument_begin|>{"command":"ls"}<|tool_call_end|>';
+      expect(rescueInlineToolCalls(text, EMPTY).calls).toBeNull();
+    });
+
+    it('does not synthesize a call from the Qwen/Hermes XML dialect', () => {
+      const text = '<tool_call>{"name":"Bash","arguments":{"command":"ls"}}</tool_call>';
+      expect(rescueInlineToolCalls(text, EMPTY).calls).toBeNull();
+    });
+
+    it('still rescues the same text when the tool WAS declared', () => {
+      const out = rescueInlineToolCalls('<function=Bash{"command":"ls"}</function>', TOOLS);
+      expect(out.calls).toEqual([{ name: 'Bash', arguments: '{"command":"ls"}' }]);
+    });
+  });
 });

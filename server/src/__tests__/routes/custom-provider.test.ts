@@ -3,6 +3,7 @@ import http from 'node:http';
 import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
+import { decrypt } from '../../lib/crypto.js';
 import { routeRequest } from '../../services/router.js';
 import { resolveProvider, getProvider } from '../../providers/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
@@ -10,7 +11,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function post(app: Express, path: string, body: any) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'POST',
@@ -26,7 +28,8 @@ async function post(app: Express, path: string, body: any) {
 }
 
 async function get(app: Express, path: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     headers: isGatedApiPath(path) ? { Authorization: `Bearer ${dashToken}` } : {},
@@ -37,7 +40,8 @@ async function get(app: Express, path: string) {
 }
 
 async function del(app: Express, path: string) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const res = await fetch(`http://127.0.0.1:${addr.port}${path}`, {
     method: 'DELETE',
@@ -48,7 +52,7 @@ async function del(app: Express, path: string) {
   return { status: res.status, body: data };
 }
 
-describe('resolveProvider (#117)', () => {
+describe('Custom Provider Endpoints', () => {
   it('builds a custom provider bound to the supplied base URL', () => {
     const p = resolveProvider('custom', 'http://127.0.0.1:8080/v1');
     expect(p).toBeDefined();
@@ -66,15 +70,17 @@ describe('resolveProvider (#117)', () => {
   });
 });
 
-describe('POST /api/keys/custom (#117)', () => {
-  let app: Express;
-
-  beforeAll(() => {
-    process.env.ENCRYPTION_KEY = '0'.repeat(64);
-    initDb(':memory:');
-    app = createApp();
-    dashToken = mintDashboardToken();
-  });
+  describe('POST /api/keys/custom (#117)', () => {
+    let app: Express;
+  
+    beforeAll(() => {
+      process.env.ENCRYPTION_KEY = '0'.repeat(64);
+      initDb(':memory:');
+      // Isolate tests to use global fallback_config
+      getDb().prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
+      app = createApp();
+      dashToken = mintDashboardToken();
+    });
 
   it('rejects an invalid base URL', async () => {
     const { status } = await post(app, '/api/keys/custom', { baseUrl: 'not-a-url', model: 'm' });
@@ -114,6 +120,33 @@ describe('POST /api/keys/custom (#117)', () => {
     const { body } = await get(app, '/api/keys');
     const custom = body.find((k: any) => k.platform === 'custom');
     expect(custom.baseUrl).toBe('http://127.0.0.1:11434/v1');
+  });
+
+  it('does not overwrite an existing endpoint key when a later submit omits apiKey', async () => {
+    const first = await post(app, '/api/keys/custom', {
+      baseUrl: 'http://127.0.0.1:7777/v1',
+      model: 'secret-model-a',
+      apiKey: 'keep-this-key',
+    });
+    expect(first.status).toBe(201);
+
+    const second = await post(app, '/api/keys/custom', {
+      baseUrl: 'http://127.0.0.1:7777/v1',
+      model: 'secret-model-b',
+    });
+    expect(second.status).toBe(201);
+
+    const key = getDb().prepare(`
+      SELECT id, encrypted_key, iv, auth_tag
+        FROM api_keys
+       WHERE platform = 'custom' AND base_url = 'http://127.0.0.1:7777/v1'
+    `).get() as { id: number; encrypted_key: string; iv: string; auth_tag: string };
+    expect(decrypt(key.encrypted_key, key.iv, key.auth_tag)).toBe('keep-this-key');
+
+    const db = getDb();
+    db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom' AND key_id = ?)").run(key.id);
+    db.prepare("DELETE FROM models WHERE platform = 'custom' AND key_id = ?").run(key.id);
+    db.prepare('DELETE FROM api_keys WHERE id = ?').run(key.id);
   });
 
   it('routes a request to the custom model through its base URL', () => {
@@ -182,7 +215,7 @@ describe('POST /api/keys/custom (#117)', () => {
         '\n',
       );
     });
-    await new Promise<void>(resolve => upstream.listen(0, resolve));
+    await new Promise<void>(resolve => upstream.listen(0, '127.0.0.1', resolve));
     const upstreamPort = (upstream.address() as any).port;
 
     // Point the custom provider at the NDJSON upstream and pin its model.
@@ -192,7 +225,8 @@ describe('POST /api/keys/custom (#117)', () => {
     });
     expect(reg.status).toBe(201);
 
-    const server = app.listen(0);
+    const server = app.listen(0, '127.0.0.1');
+    if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
     const addr = server.address() as any;
     const res = await fetch(`http://127.0.0.1:${addr.port}/v1/chat/completions`, {
       method: 'POST',
@@ -217,7 +251,8 @@ describe('POST /api/keys/custom (#117)', () => {
       const db = getDb();
       db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
       db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
-      db.prepare("DELETE FROM api_keys WHERE platform = 'custom'").run();
+      db.prepare('DELETE FROM api_keys').run();
+      db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
 
       const a = await post(app, '/api/keys/custom', { baseUrl: 'http://127.0.0.1:11434/v1', model: 'llama3:8b', label: 'Ollama box' });
       const b = await post(app, '/api/keys/custom', { baseUrl: 'http://127.0.0.1:1234/v1', model: 'qwen3:4b', label: 'LM Studio' });
@@ -275,6 +310,238 @@ describe('POST /api/keys/custom (#117)', () => {
       const keys = db.prepare("SELECT base_url FROM api_keys WHERE platform = 'custom'").all() as any[];
       expect(keys.length).toBe(1);
       expect(keys[0].base_url).toBe('http://127.0.0.1:1234/v1');
+    });
+  });
+
+  // #281: one submit can bind several model ids to a single endpoint, instead
+  // of forcing one POST per model.
+  describe('multiple models per endpoint (#281)', () => {
+    beforeAll(() => {
+      const db = getDb();
+      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
+      db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
+      db.prepare("DELETE FROM api_keys WHERE platform = 'custom'").run();
+    });
+
+    it('registers every model in the models array against one endpoint key', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9999/v1',
+        models: ['gemma3:1b', { model: 'phi4:14b', displayName: 'Phi 4' }],
+        label: 'Multi box',
+      });
+      expect(status).toBe(201);
+      // Back-compat fields echo the first model; `models` carries the full set.
+      expect(body.model).toBe('gemma3:1b');
+      expect(body.models).toHaveLength(2);
+      expect(body.models.map((m: any) => m.model).sort()).toEqual(['gemma3:1b', 'phi4:14b']);
+      expect(body.models.find((m: any) => m.model === 'phi4:14b').displayName).toBe('Phi 4');
+
+      const db = getDb();
+      const keys = db.prepare("SELECT id FROM api_keys WHERE platform = 'custom' AND base_url = 'http://127.0.0.1:9999/v1'").all();
+      expect(keys.length).toBe(1); // one endpoint, one key
+      const models = db.prepare("SELECT model_id FROM models WHERE platform = 'custom' AND key_id = ?").all((keys[0] as any).id) as any[];
+      expect(models.map(m => m.model_id).sort()).toEqual(['gemma3:1b', 'phi4:14b']);
+      for (const m of body.models) {
+        expect(db.prepare('SELECT 1 FROM fallback_config WHERE model_db_id = ?').get(m.modelDbId)).toBeDefined();
+      }
+    });
+
+    it('dedupes repeated ids and ignores blanks', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9999/v1',
+        models: ['dupe:1', 'dupe:1', '   '],
+      });
+      expect(status).toBe(201);
+      expect(body.models).toHaveLength(1);
+      expect(body.models[0].model).toBe('dupe:1');
+    });
+
+    it('rejects a submit with neither model nor models', async () => {
+      const { status } = await post(app, '/api/keys/custom', { baseUrl: 'http://127.0.0.1:9999/v1' });
+      expect(status).toBe(400);
+    });
+
+    // The dashboard's custom form always posts the plural `models`, even for a
+    // single id, and puts the name it collected in the top-level displayName.
+    // That name used to be bound to the singular `model` alone, so the field
+    // was a no-op and the row landed named after its model id (#704).
+    it('applies the top-level displayName to a lone model sent as a models array', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9998/v1',
+        models: ['qwen3:4b'],
+        displayName: 'My Local Qwen',
+      });
+      expect(status).toBe(201);
+      expect(body.models[0].displayName).toBe('My Local Qwen');
+
+      const row = getDb().prepare(
+        "SELECT display_name FROM models WHERE platform = 'custom' AND model_id = 'qwen3:4b'",
+      ).get() as any;
+      expect(row.display_name).toBe('My Local Qwen');
+    });
+
+    it('never fans a single displayName out across several ids', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9997/v1',
+        models: ['mistral:7b', 'gemma2:9b'],
+        displayName: 'Should Not Apply',
+      });
+      expect(status).toBe(201);
+      expect(body.models.map((m: any) => m.displayName).sort()).toEqual(['gemma2:9b', 'mistral:7b']);
+    });
+
+    it('lets a per-entry displayName win over the top-level one', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9996/v1',
+        models: [{ model: 'phi4:mini', displayName: 'Per Entry' }],
+        displayName: 'Top Level',
+      });
+      expect(status).toBe(201);
+      expect(body.models[0].displayName).toBe('Per Entry');
+    });
+
+    // The name is optional in the form and optional on the wire: not naming a
+    // model is a real choice, not an omission to paper over.
+    it.each([
+      ['omitted', undefined],
+      ['empty', ''],
+      ['blank', '   '],
+    ])('falls back to the model id when the display name is %s', async (kind, displayName) => {
+      const modelId = `unnamed-${kind}`;
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9995/v1',
+        models: [modelId],
+        ...(displayName === undefined ? {} : { displayName }),
+      });
+      expect(status).toBe(201);
+      expect(body.models[0].displayName).toBe(modelId);
+
+      const row = getDb().prepare(
+        "SELECT display_name FROM models WHERE platform = 'custom' AND model_id = ?",
+      ).get(modelId) as any;
+      expect(row.display_name).toBe(modelId);
+    });
+
+    // "Fetch models" (#488) re-posts bare ids for everything the endpoint
+    // serves, including models already registered. Leaving the name out must
+    // mean "no opinion", not "reset it" — the same rule the capability flags
+    // already follow.
+    it('keeps a name already on the model when a later submit omits one', async () => {
+      await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9994/v1',
+        models: ['keeper:1'],
+        displayName: 'Kept Name',
+      });
+
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9994/v1',
+        models: ['keeper:1', 'newcomer:1'],
+      });
+      expect(status).toBe(201);
+      expect(body.models.find((m: any) => m.model === 'keeper:1').displayName).toBe('Kept Name');
+      // …while a model nobody named still takes its id.
+      expect(body.models.find((m: any) => m.model === 'newcomer:1').displayName).toBe('newcomer:1');
+
+      const row = getDb().prepare(
+        "SELECT display_name FROM models WHERE platform = 'custom' AND model_id = 'keeper:1'",
+      ).get() as any;
+      expect(row.display_name).toBe('Kept Name');
+    });
+
+    it('still renames a model when a later submit does name one', async () => {
+      await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9993/v1',
+        models: ['renamed:1'],
+        displayName: 'First Name',
+      });
+      const { body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:9993/v1',
+        models: ['renamed:1'],
+        displayName: 'Second Name',
+      });
+      expect(body.models[0].displayName).toBe('Second Name');
+    });
+  });
+
+  // #470: custom models used to register with supports_tools = 0, so agentic
+  // clients that send `tools` matched zero of them and hit a false "all models
+  // exhausted" error. Registration now defaults tools on, vision off.
+  describe('capability defaults (#470)', () => {
+    beforeAll(() => {
+      const db = getDb();
+      db.prepare("DELETE FROM fallback_config WHERE model_db_id IN (SELECT id FROM models WHERE platform = 'custom')").run();
+      db.prepare("DELETE FROM models WHERE platform = 'custom'").run();
+      db.prepare("DELETE FROM api_keys WHERE platform = 'custom'").run();
+    });
+
+    function toolsVision(modelId: string) {
+      return getDb()
+        .prepare("SELECT supports_tools, supports_vision FROM models WHERE platform = 'custom' AND model_id = ?")
+        .get(modelId) as { supports_tools: number; supports_vision: number };
+    }
+
+    it('defaults a new custom model to tools on, vision off', async () => {
+      const { status, body } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5001/v1',
+        model: 'defaults-model',
+      });
+      expect(status).toBe(201);
+      expect(toolsVision('defaults-model')).toEqual({ supports_tools: 1, supports_vision: 0 });
+      // Echoed back to the client so the UI can render the capability badges.
+      expect(body.supportsTools).toBe(true);
+      expect(body.supportsVision).toBe(false);
+    });
+
+    it('honors submit-level supportsTools / supportsVision flags', async () => {
+      const { status } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5002/v1',
+        model: 'vision-no-tools',
+        supportsTools: false,
+        supportsVision: true,
+      });
+      expect(status).toBe(201);
+      expect(toolsVision('vision-no-tools')).toEqual({ supports_tools: 0, supports_vision: 1 });
+    });
+
+    it('honors per-entry flags in the models array and per-model defaults', async () => {
+      const { status } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5003/v1',
+        models: [
+          { model: 'entry-vision', supportsVision: true },
+          'entry-default',
+        ],
+      });
+      expect(status).toBe(201);
+      expect(toolsVision('entry-vision')).toEqual({ supports_tools: 1, supports_vision: 1 });
+      expect(toolsVision('entry-default')).toEqual({ supports_tools: 1, supports_vision: 0 });
+    });
+
+    it('preserves a stored capability when re-registration omits the flag', async () => {
+      await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5004/v1',
+        model: 'preserve-model',
+        supportsTools: false,
+      });
+      expect(toolsVision('preserve-model')).toEqual({ supports_tools: 0, supports_vision: 0 });
+
+      // Re-submit the same endpoint/model without capability flags — the earlier
+      // tools = 0 the user chose must survive, not snap back to the default.
+      const { status } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5004/v1',
+        model: 'preserve-model',
+        displayName: 'Renamed',
+      });
+      expect(status).toBe(201);
+      expect(toolsVision('preserve-model')).toEqual({ supports_tools: 0, supports_vision: 0 });
+    });
+
+    it('rejects a non-boolean capability flag', async () => {
+      const { status } = await post(app, '/api/keys/custom', {
+        baseUrl: 'http://127.0.0.1:5005/v1',
+        model: 'bad-flag',
+        supportsTools: 'yes',
+      });
+      expect(status).toBe(400);
     });
   });
 });

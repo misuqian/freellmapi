@@ -3,11 +3,13 @@ import type { Express } from 'express';
 import { createApp } from '../../app.js';
 import { initDb, getDb, getUnifiedApiKey } from '../../db/index.js';
 import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
+import { clearReasoningMemory } from '../../routes/proxy.js';
 
 let dashToken = '';
 
 async function request(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -44,6 +46,8 @@ describe('Proxy tool-calling support', () => {
     const db = getDb();
     db.prepare('DELETE FROM api_keys').run();
     db.prepare('DELETE FROM requests').run();
+
+    clearReasoningMemory();
 
     const addKey = await request(app, 'POST', '/api/keys', {
       platform: 'groq',
@@ -180,5 +184,195 @@ describe('Proxy tool-calling support', () => {
     expect(providerBody.messages[2].role).toBe('tool');
     expect(providerBody.messages[2].tool_call_id).toBe('call_weather_1');
     expect(body.choices[0].message.content).toContain('30C');
+  });
+
+  it('round-trips assistant reasoning_content on follow-up turns (DeepSeek thinking — #255)', async () => {
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-r', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{ index: 0, message: { role: 'assistant', content: 'done' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const { status } = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'think then answer' },
+        {
+          role: 'assistant',
+          content: 'partial',
+          // What a DeepSeek thinking model returned last turn and the client
+          // replayed. Stripping it makes OpenCode Zen 400 on this request.
+          reasoning_content: 'Let me reason about this step by step...',
+        },
+        { role: 'user', content: 'continue' },
+      ],
+    }, authHeaders());
+
+    expect(status).toBe(200);
+    expect(providerBody.messages[1].role).toBe('assistant');
+    expect(providerBody.messages[1].reasoning_content).toBeUndefined();
+  });
+
+  it('restores session reasoning_content the client dropped on replay (#797)', async () => {
+    const origFetch = global.fetch;
+    let turn = 0;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        turn += 1;
+        if (turn === 2) providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-r', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: turn === 1 ? 'first answer' : 'second answer',
+                // Turn 1 is a thinking turn: the provider returns a trace the
+                // proxy must remember for the session.
+                ...(turn === 1 ? { reasoning_content: 'session trace from turn one' } : {}),
+              },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const sessHeaders = { ...authHeaders(), 'x-session-id': 'sess-797' };
+
+    // Turn 1: thinking model returns reasoning_content → proxy records it.
+    const first = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'think then answer' }],
+    }, sessHeaders);
+    expect(first.status).toBe(200);
+
+    // Turn 2: same session; opencode-style replay strips reasoning_content
+    // (AI-SDK convertToOpenAICompatibleChatMessages). The proxy must restore
+    // the trace it returned last turn or OpenCode Zen 400s.
+    const second = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'think then answer' },
+        { role: 'assistant', content: 'first answer' },
+        { role: 'user', content: 'continue' },
+      ],
+    }, sessHeaders);
+    expect(second.status).toBe(200);
+    expect(providerBody.messages[1].role).toBe('assistant');
+    expect(providerBody.messages[1].reasoning_content).toBeUndefined();
+  });
+
+  it('sends the client\'s messages untouched when the session remembers no reasoning (#797)', async () => {
+    const origFetch = global.fetch;
+    let providerBody: any = null;
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        providerBody = JSON.parse((init as any).body);
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-p', object: 'chat.completion', created: 1, model: 'm',
+            // No reasoning_content anywhere in this session.
+            choices: [{ index: 0, message: { role: 'assistant', content: 'plain answer 2' }, finish_reason: 'stop' }],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const sent = [
+      { role: 'user', content: 'no thinking in this session' },
+      { role: 'assistant', content: 'plain answer' },
+      { role: 'user', content: 'continue' },
+    ];
+
+    const { status } = await request(app, 'POST', '/v1/chat/completions', { messages: sent },
+      { ...authHeaders(), 'x-session-id': 'sess-797-plain' });
+
+    expect(status).toBe(200);
+    // Byte-identical: no restore, no empty-string filler, no reordering.
+    expect(providerBody.messages).toEqual(sent);
+    expect(providerBody.messages.some((m: any) => 'reasoning_content' in m)).toBe(false);
+  });
+
+  it('restores only into the outbound copy, so a failover hop still sends the client\'s bytes (#797)', async () => {
+    const origFetch = global.fetch;
+    const calls: any[] = [];
+
+    vi.spyOn(global, 'fetch').mockImplementation(async (url, init) => {
+      const urlStr = typeof url === 'string' ? url : url.toString();
+      if (urlStr.includes('api.groq.com/openai/v1/chat/completions')) {
+        calls.push(JSON.parse((init as any).body));
+        // Call 1 is turn 1 (records the trace). Call 2 is turn 2's first
+        // attempt — rate-limited so the request fails over to another model.
+        if (calls.length === 2) {
+          return new Response(JSON.stringify({ error: { message: 'rate limited' } }), { status: 429 }) as any;
+        }
+        return {
+          ok: true,
+          json: () => Promise.resolve({
+            id: 'chatcmpl-f', object: 'chat.completion', created: 1, model: 'm',
+            choices: [{
+              index: 0,
+              message: {
+                role: 'assistant',
+                content: 'answer',
+                ...(calls.length === 1 ? { reasoning_content: 'trace bound to the first model' } : {}),
+              },
+              finish_reason: 'stop',
+            }],
+            usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+          }),
+        } as any;
+      }
+      return origFetch(url, init);
+    });
+
+    const sessHeaders = { ...authHeaders(), 'x-session-id': 'sess-797-failover' };
+
+    const first = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [{ role: 'user', content: 'think then answer' }],
+    }, sessHeaders);
+    expect(first.status).toBe(200);
+
+    const second = await request(app, 'POST', '/v1/chat/completions', {
+      messages: [
+        { role: 'user', content: 'think then answer' },
+        { role: 'assistant', content: 'answer' },
+        { role: 'user', content: 'continue' },
+      ],
+    }, sessHeaders);
+    expect(second.status).toBe(200);
+    expect(calls).toHaveLength(3);
+
+    // Attempt 1 goes to the model that produced the trace — restored.
+    expect(calls[1].messages[1].reasoning_content).toBeUndefined();
+    // Attempt 2 is a different model. The restore lived on the outbound copy
+    // only, so this hop carries exactly what the client sent — no leaked
+    // reasoning_content from the mutated request body.
+    expect(calls[2].model).not.toBe(calls[1].model);
+    expect(calls[2].messages[1].reasoning_content).toBeUndefined();
+    expect(calls[2].messages.some((m: any) => 'reasoning_content' in m)).toBe(false);
   });
 });

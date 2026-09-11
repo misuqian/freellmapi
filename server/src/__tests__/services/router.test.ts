@@ -1,7 +1,13 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, afterEach, vi } from 'vitest';
 import { initDb, getDb } from '../../db/index.js';
 import { encrypt } from '../../lib/crypto.js';
-import { routeRequest, setRoutingStrategy } from '../../services/router.js';
+import {
+  getAllPenalties,
+  recordRateLimitHit,
+  routeRequest,
+  setRoutingStrategy,
+} from '../../services/router.js';
+import { setCooldown } from '../../services/ratelimit.js';
 
 describe('Router', () => {
   beforeAll(() => {
@@ -15,12 +21,18 @@ describe('Router', () => {
     // bandit (now the default strategy) doesn't reorder by score.
     setRoutingStrategy('priority');
     db.prepare('DELETE FROM api_keys').run();
+    // Disable active profile so the router falls back to fallback_config
+    db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
     // Reset fallback order to intelligence ranking
     const models = db.prepare('SELECT id, intelligence_rank FROM models ORDER BY intelligence_rank ASC').all() as any[];
     const update = db.prepare('UPDATE fallback_config SET priority = ? WHERE model_db_id = ?');
     for (let i = 0; i < models.length; i++) {
       update.run(i + 1, models[i].id);
     }
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
   it('should throw when no keys are configured', () => {
@@ -124,6 +136,94 @@ describe('Router', () => {
     expect(large.modelDbId).not.toBe(baseline.modelDbId);
   });
 
+  it('skips GitHub GPT-4.1 above its free-tier 8K request cap (#426)', () => {
+    const db = getDb();
+    const githubKey = encrypt('test-github-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('github', 'github', githubKey.encrypted, githubKey.iv, githubKey.authTag, 'healthy', 1);
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'groq', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+
+    const github = db.prepare(`
+      SELECT id, context_window FROM models
+       WHERE platform = 'github' AND model_id = 'openai/gpt-4.1'
+    `).get() as { id: number; context_window: number };
+    const groq = db.prepare(`
+      SELECT id FROM models
+       WHERE platform = 'groq' AND context_window > 9000
+       LIMIT 1
+    `).get() as { id: number };
+
+    db.prepare('UPDATE fallback_config SET priority = 1000, enabled = 1').run();
+    db.prepare('UPDATE fallback_config SET priority = 1 WHERE model_db_id = ?').run(github.id);
+    db.prepare('UPDATE fallback_config SET priority = 2 WHERE model_db_id = ?').run(groq.id);
+    db.prepare(`
+      UPDATE models SET tpm_limit = NULL, tpd_limit = NULL
+       WHERE id IN (?, ?)
+    `).run(github.id, groq.id);
+
+    expect(github.context_window).toBe(8000);
+    expect(routeRequest(7000).modelDbId).toBe(github.id);
+    expect(routeRequest(9000).modelDbId).toBe(groq.id);
+  });
+
+  it('prefers margin-fitting models but still serves raw-window fits (#956 review)', () => {
+    const db = getDb();
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'groq', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+
+    const groq = db.prepare(`
+      SELECT id FROM models
+       WHERE platform = 'groq' AND context_window = 131072
+       LIMIT 1
+    `).get() as { id: number };
+
+    db.prepare('UPDATE fallback_config SET priority = 1000, enabled = 1').run();
+    db.prepare('UPDATE fallback_config SET priority = 1 WHERE model_db_id = ?').run(groq.id);
+    db.prepare('UPDATE models SET tpm_limit = NULL, tpd_limit = NULL WHERE id = ?').run(groq.id);
+
+    // CONTEXT_WINDOW_SAFETY_FACTOR: the chars/4 estimate under-counts dense
+    // payloads (JSON, code), so the preferred ceiling is window / 1.25.
+    // 131072 / 1.25 = 104857.6. A margin-fitting runner-up on another platform
+    // must NOT outrank the priority-1 model while the estimate is inside the
+    // margin.
+    const googleKey = encrypt('test-google-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('google', 'google', googleKey.encrypted, googleKey.iv, googleKey.authTag, 'healthy', 1);
+    const google = db.prepare(`
+      SELECT id FROM models
+       WHERE platform = 'google' AND context_window >= 132500 AND enabled = 1
+       ORDER BY intelligence_rank ASC
+       LIMIT 1
+    `).get() as { id: number };
+    expect(google).toBeDefined();
+    db.prepare('UPDATE fallback_config SET priority = 2 WHERE model_db_id = ?').run(google.id);
+    db.prepare('UPDATE models SET tpm_limit = NULL, tpd_limit = NULL WHERE id = ?').run(google.id);
+
+    expect(routeRequest(104000).modelDbId).toBe(groq.id);
+
+    // Above the margin ceiling the priority-1 model is DEMOTED, not excluded:
+    // /v1/models advertises the raw window, so a client that packs past the
+    // margin gets the margin-fitting runner-up instead of "all models exhausted".
+    expect(routeRequest(106000).modelDbId).not.toBe(groq.id);
+    expect(routeRequest(106000).modelDbId).toBe(google.id);
+
+    // When nothing fits WITH the margin anywhere, the raw advertised window is
+    // still honored — one attempt rather than an empty pool.
+    db.prepare("DELETE FROM api_keys WHERE platform = 'google'").run();
+    expect(routeRequest(106000).modelDbId).toBe(groq.id);
+  });
+
   it('still routes a model with an unknown (null) context window (#167)', () => {
     const db = getDb();
     const groqKey = encrypt('test-groq-key');
@@ -157,5 +257,74 @@ describe('Router', () => {
     expect(result.platform).toBe('groq');
     expect(result.apiKey).toBe('test-groq-key');
     expect(corruptKey.status).toBe('error');
+  });
+
+  it('applies elapsed decay before adding a new 429 penalty', () => {
+    vi.useFakeTimers();
+    const modelDbId = 987654321;
+
+    recordRateLimitHit(modelDbId);
+    vi.advanceTimersByTime(10 * 60 * 1000);
+    recordRateLimitHit(modelDbId);
+
+    expect(getAllPenalties()).toContainEqual({
+      modelDbId,
+      count: 2,
+      penalty: 3,
+    });
+  });
+});
+
+describe('Router exhaustion diagnostics (issue _1)', () => {
+  beforeAll(() => {
+    process.env.ENCRYPTION_KEY = '0'.repeat(64);
+    initDb(':memory:');
+  });
+
+  beforeEach(() => {
+    const db = getDb();
+    setRoutingStrategy('priority');
+    db.prepare('DELETE FROM api_keys').run();
+    db.prepare("DELETE FROM settings WHERE key = 'active_profile_id'").run();
+    db.prepare('DELETE FROM rate_limit_cooldowns').run();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('attaches a non-empty per-model disposition to the exhaustion error', () => {
+    // No keys configured → every chain model is unroutable. The thrown error
+    // must carry diagnostics so the synchronous routing_error is debuggable
+    // instead of opaque (the failure that NOTHING else logs).
+    let caught: any;
+    try { routeRequest(); } catch (e) { caught = e; }
+    expect(caught).toBeDefined();
+    expect(Array.isArray(caught.diagnostics)).toBe(true);
+    expect(caught.diagnostics.length).toBeGreaterThan(0);
+    // Every entry is "<platform>/<model>: <reason>"; with no keys the reason is
+    // the platform having no enabled+healthy key.
+    expect(caught.diagnostics.every((d: string) => d.includes(': '))).toBe(true);
+    expect(caught.diagnostics.some((d: string) => /no enabled.*key/i.test(d))).toBe(true);
+  });
+
+  it('records cooldown as the skip reason for a benched key', () => {
+    const db = getDb();
+    const groqKey = encrypt('test-groq-key');
+    db.prepare(`
+      INSERT INTO api_keys (platform, label, encrypted_key, iv, auth_tag, status, enabled)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run('groq', 'test', groqKey.encrypted, groqKey.iv, groqKey.authTag, 'healthy', 1);
+
+    // Bench every groq model on this key, so the only configured provider is
+    // fully cooled down and the pool empties with a key present (not absent).
+    const keyId = (db.prepare("SELECT id FROM api_keys WHERE platform='groq'").get() as { id: number }).id;
+    const groqModels = db.prepare("SELECT model_id FROM models WHERE platform='groq' AND enabled=1").all() as { model_id: string }[];
+    for (const m of groqModels) setCooldown('groq', m.model_id, keyId, 5 * 60 * 1000);
+
+    let caught: any;
+    try { routeRequest(); } catch (e) { caught = e; }
+    expect(caught).toBeDefined();
+    expect(caught.diagnostics.some((d: string) => /cooldown/.test(d))).toBe(true);
   });
 });

@@ -7,7 +7,8 @@ import { mintDashboardToken, isGatedApiPath } from '../helpers/auth.js';
 let dashToken = '';
 
 async function req(app: Express, method: string, path: string, body?: any, headers: Record<string, string> = {}) {
-  const server = app.listen(0);
+  const server = app.listen(0, '127.0.0.1');
+  if (!server.listening) await new Promise<void>(resolve => server.once('listening', () => resolve()));
   const addr = server.address() as any;
   const url = `http://127.0.0.1:${addr.port}${path}`;
 
@@ -162,23 +163,23 @@ describe('Full Integration Flow', () => {
     expect(s2).toBe(400);
   });
 
-  it('Step 11: Explicit unknown model returns 400 (not silent fallthrough)', async () => {
+  it('Step 11: Explicit unknown model returns an honest 404 (not silent fallthrough)', async () => {
     const { status, body } = await req(app, 'POST', '/v1/chat/completions', {
       model: 'definitely-not-a-real-model',
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
-    expect(status).toBe(400);
+    expect(status).toBe(404);
     expect(body.error.code).toBe('model_not_found');
     expect(body.error.message).toContain('not in the catalog');
   });
 
-  it('Step 12: Explicit disabled model returns 400 with disabled reason', async () => {
+  it('Step 12: Explicit disabled model returns an honest 404 with disabled reason', async () => {
     // gemini-2.5-pro is disabled (V1 migration). Reuse it as a known-disabled fixture.
     const { status, body } = await req(app, 'POST', '/v1/chat/completions', {
       model: 'gemini-2.5-pro',
       messages: [{ role: 'user', content: 'hi' }],
     }, authHeaders());
-    expect(status).toBe(400);
+    expect(status).toBe(404);
     expect(body.error.code).toBe('model_not_found');
     expect(body.error.message).toContain('is disabled');
   });

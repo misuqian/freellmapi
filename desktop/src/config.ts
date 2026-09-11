@@ -4,7 +4,21 @@ import { app } from 'electron';
 
 export interface DesktopConfig {
   port?: number;
-  theme?: 'dark' | 'light';
+  theme?: 'dark' | 'light' | 'system';
+  // BCP-47 locale mirrored from the dashboard (en, zh-CN, fr, es, pt-BR).
+  locale?: string;
+  // Bind the embedded server to 0.0.0.0 instead of 127.0.0.1 so other devices
+  // on the LAN / Tailscale can reach it (#442, #418). Off by default: exposes
+  // the API, guarded only by the unified key. Applied at next server start.
+  lanAccess?: boolean;
+  // App version the "macOS is hiding your menu-bar icon" notice was last shown
+  // for (#807). Explaining the fix once per version is enough; the tray can stay
+  // hidden for as long as the user wants it hidden.
+  trayHiddenNoticeVersion?: string;
+  // Show the app in the Dock as well as the menu bar. On by default: the tray
+  // icon alone is a poor "is it running?" signal, and macOS 26 can hide it
+  // outright (#807). Users who want the lean menu-bar-only look turn it off.
+  showInDock?: boolean;
 }
 
 function configPath(): string {

@@ -19,6 +19,26 @@ if (arg) {
 // no Sign out) when running inside the desktop shell.
 contextBridge.exposeInMainWorld('__FREEAPI_DESKTOP__', true);
 
+// The dashboard window signs in as the hidden machine account, whose password
+// is random and never shown, so it must never land on the login form. When the
+// seeded session is gone (expired after 30 days of uptime, or cleared by a 401)
+// AuthGate asks the main process for a fresh one instead. Exposed as a bare
+// function rather than a broader bridge: the renderer loads http://127.0.0.1,
+// and every extra capability handed to that world is one an XSS could use —
+// this one only ever hands back a session for the account the window already
+// runs as.
+contextBridge.exposeInMainWorld('__FREEAPI_SESSION__', () => ipcRenderer.invoke('freeapi:session-token'));
+
+// The running build's version, so the dashboard can show which one it is and
+// offer a check against the published releases (#703). Arrives the same way the
+// token does; absent in a browser, where the dashboard simply omits the row
+// rather than guessing from the server's own (unrelated) package version.
+const versionArg = process.argv.find((a) => a.startsWith('--freeapi-version='));
+contextBridge.exposeInMainWorld(
+  '__FREEAPI_VERSION__',
+  versionArg ? versionArg.slice('--freeapi-version='.length) : null,
+);
+
 // `desktop` class on <html> activates the client's translucent backdrop
 // (html.desktop in index.css). CAREFUL: for an http:// load the preload
 // runs before the page's document is parsed — documentElement is null or
@@ -36,21 +56,35 @@ try {
 }
 
 // Mirror the dashboard's theme to the main process so the tray popover
-// matches. The dashboard expresses its theme as the `dark` class on
-// documentElement (set by the early script in index.html and toggled by
-// the navbar) — observe that class rather than reaching across worlds
-// into localStorage.
+// matches. The dashboard expresses its resolved theme as the `dark` class
+// and the underlying choice (dark/light/system) as `data-theme-choice`,
+// both on documentElement — observe those rather than reaching across
+// worlds into localStorage. The choice lets the main process hand
+// nativeTheme.themeSource back to the OS when the user picks System.
 function reportTheme() {
-  ipcRenderer.send(
-    'freeapi:theme-changed',
-    document.documentElement.classList.contains('dark') ? 'dark' : 'light',
-  );
+  ipcRenderer.send('freeapi:theme-changed', {
+    resolved: document.documentElement.classList.contains('dark') ? 'dark' : 'light',
+    choice: document.documentElement.dataset.themeChoice,
+  });
+}
+
+// Mirror the dashboard's locale to the main process so the native tray menu and
+// the popover match. The I18nProvider sets `<html lang>` on every locale change,
+// so observe that attribute rather than reaching into the dashboard's
+// localStorage from this preload world.
+function reportLocale() {
+  const lang = document.documentElement.lang;
+  if (lang) ipcRenderer.send('freeapi:locale-changed', lang);
 }
 window.addEventListener('DOMContentLoaded', () => {
   applyDesktopClass();
   reportTheme();
-  new MutationObserver(reportTheme).observe(document.documentElement, {
+  reportLocale();
+  new MutationObserver(() => {
+    reportTheme();
+    reportLocale();
+  }).observe(document.documentElement, {
     attributes: true,
-    attributeFilter: ['class'],
+    attributeFilter: ['class', 'lang', 'data-theme-choice'],
   });
 });
